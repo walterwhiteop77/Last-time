@@ -72,11 +72,12 @@ async def _run_ptb(app) -> None:
 async def main() -> None:
     print("[main] Starting TG Automation Bot...")
 
-    ub.init_client()
+    # init_client is now async — it loads the session from MongoDB if available
+    await ub.init_client()
     await ub.connect()
 
-    async def on_new_post(message, link):
-        await process_post(message, link, ub.userbot, None)
+    async def on_new_post(message, links):
+        await process_post(message, links, ub.userbot, None)
 
     ub.set_forward_callback(on_new_post)
     ptb_app = build_app()

@@ -133,15 +133,16 @@ async def begin_listening():
         print(f"[userbot] ✅ New post in source channel — msg_id={event.message.id}")
         await log_event("new_post", {"msg_id": event.message.id, "chat_id": chat_id})
 
-        link = _extract_link(event.message)
-        if not link:
-            print(f"[userbot] ⚠️ No link in post {event.message.id} — skipping")
+        # Extract ALL links from the post (supports 1 or 2 links)
+        links = _extract_links(event.message)
+        if not links:
+            print(f"[userbot] ⚠️ No links in post {event.message.id} — skipping")
             return
 
-        print(f"[userbot] 🔗 Extracted link: {link}")
+        print(f"[userbot] 🔗 Extracted {len(links)} link(s): {links}")
 
         if _forward_callback:
-            asyncio.create_task(_forward_callback(event.message, link))
+            asyncio.create_task(_forward_callback(event.message, links))
 
     print("[userbot] Authorized and listening for new posts.")
     await userbot.run_until_disconnected()
@@ -211,22 +212,22 @@ async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0) -
 
     matched = []
     async for message in userbot.iter_messages(entity, **kwargs):
-        link = _extract_link(message)
-        if link:
-            matched.append((message, link))
+        links = _extract_links(message)
+        if links:
+            matched.append((message, links))
 
     matched.reverse()
     print(f"[userbot] scan: {len(matched)} posts with links (oldest→newest)")
 
     reset_scan_cancel()
     processed = 0
-    for message, link in matched:
+    for message, links in matched:
         if _scan_cancelled:
             print(f"[userbot] scan: ⛔ cancelled by /stop after {processed} posts")
             break
-        print(f"[userbot] scan: msg {message.id} → {link}")
+        print(f"[userbot] scan: msg {message.id} → {links}")
         if callback:
-            await callback(message, link)
+            await callback(message, links)
         processed += 1
 
     return processed
@@ -242,22 +243,22 @@ async def scan_range(source: str, start_id: int, end_id: int, callback) -> int:
     print(f"[userbot] scan_range: fetching messages {start_id}–{end_id}")
     matched = []
     async for message in userbot.iter_messages(entity, min_id=start_id - 1, max_id=end_id):
-        link = _extract_link(message)
-        if link:
-            matched.append((message, link))
+        links = _extract_links(message)
+        if links:
+            matched.append((message, links))
 
     matched.reverse()
     print(f"[userbot] scan_range: {len(matched)} post(s) with links")
 
     reset_scan_cancel()
     processed = 0
-    for message, link in matched:
+    for message, links in matched:
         if _scan_cancelled:
             print(f"[userbot] scan_range: ⛔ cancelled after {processed} posts")
             break
-        print(f"[userbot] scan_range: msg {message.id} → {link}")
+        print(f"[userbot] scan_range: msg {message.id} → {links}")
         if callback:
-            await callback(message, link)
+            await callback(message, links)
         processed += 1
 
     return processed
@@ -270,11 +271,11 @@ async def process_single(source: str, msg_id: int, callback) -> bool:
         if not messages:
             return False
         message = messages[0]
-        link = _extract_link(message)
-        if not link:
+        links = _extract_links(message)
+        if not links:
             return False
         if callback:
-            asyncio.create_task(callback(message, link))
+            asyncio.create_task(callback(message, links))
         return True
     except Exception as e:
         print(f"[userbot] process_single error: {e}")
@@ -289,43 +290,58 @@ def _clean_url(url: str) -> str:
     return _TRAILING_JUNK.sub("", url)
 
 
-def _extract_link(message) -> str | None:
+def _extract_links(message) -> list:
+    """
+    Extract ALL Telegram bot/deep links from a message.
+    Returns a list of URL strings (may contain 1 or more links).
+    Deduplicates while preserving order.
+    """
     text = (getattr(message, 'text', None) or
             getattr(message, 'message', None) or
             getattr(message, 'caption', None) or "")
 
+    seen = {}  # ordered dedup: url → True
+
+    # 1. Named-URL entities (MessageEntityTextUrl) — highest priority
     if message.entities:
         for entity in message.entities:
             if isinstance(entity, MessageEntityTextUrl):
                 url = _clean_url(entity.url)
                 if TG_LINK_RE.match(url):
-                    return url
+                    seen[url] = True
             elif isinstance(entity, MessageEntityUrl):
                 start = entity.offset
                 end = entity.offset + entity.length
                 url = _clean_url(text[start:end])
                 if TG_LINK_RE.match(url):
-                    return url
+                    seen[url] = True
 
-    m = TG_LINK_RE.search(text)
-    if m:
-        return _clean_url(m.group(0))
+    # 2. Plain-text URLs in the message body
+    for m in TG_LINK_RE.finditer(text):
+        url = _clean_url(m.group(0))
+        if url not in seen:
+            seen[url] = True
 
-    any_url = re.compile(r"https?://[^\s]+")
-    m2 = any_url.search(text)
-    if m2:
-        return m2.group(0)
-
-    if message.reply_markup:
+    # 3. Inline keyboard buttons (fallback)
+    if not seen and message.reply_markup:
         try:
             for row in message.reply_markup.rows:
                 for btn in row.buttons:
                     if hasattr(btn, "url") and btn.url:
-                        return btn.url
+                        seen[btn.url] = True
         except Exception:
             pass
 
-    return None
+    return list(seen.keys())
+
+
+def _extract_link(message) -> str | None:
+    """
+    Legacy single-link helper — returns the first TG link found, or None.
+    Kept for backward compatibility.
+    """
+    links = _extract_links(message)
+    return links[0] if links else None
 
 
 async def click_bot_link_and_get_files(link: str) -> list:

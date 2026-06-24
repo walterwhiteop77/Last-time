@@ -19,7 +19,7 @@ _forward_callback = None
 # Fired once login completes so main.py can start listening
 login_done = asyncio.Event()
 
-# Set to True to cancel any running scan
+# Set to True to cancel any running scan / fbatch
 _scan_cancelled: bool = False
 
 
@@ -38,21 +38,50 @@ def set_forward_callback(fn):
     _forward_callback = fn
 
 
-def init_client():
+async def init_client():
     """
     Create the TelegramClient.
-    - If SESSION_STRING env var is set → use StringSession (persists across
-      Render restarts without a file).
-    - Otherwise fall back to a local .session file (good for local dev).
+    Priority order for session:
+      1. SESSION_STRING env var  (set explicitly by operator)
+      2. session_string stored in MongoDB  (saved automatically after /login)
+      3. Local .session file  (fallback for local dev)
+    This ensures the userbot stays logged in across server restarts.
     """
     global userbot
+    session = None
+
     if SESSION_STRING:
-        print("[userbot] Using SESSION_STRING (StringSession)")
+        print("[userbot] Using SESSION_STRING env var (StringSession)")
         session = StringSession(SESSION_STRING)
     else:
-        print("[userbot] Using file session:", SESSION_NAME)
-        session = SESSION_NAME
+        try:
+            from database import get_session_string
+            stored = await get_session_string()
+            if stored:
+                session = StringSession(stored)
+                print("[userbot] Loaded session string from MongoDB — no re-login needed")
+            else:
+                print("[userbot] No stored session — using file session:", SESSION_NAME)
+                session = SESSION_NAME
+        except Exception as e:
+            print(f"[userbot] Could not read session from MongoDB ({e}) — using file session")
+            session = SESSION_NAME
+
     userbot = TelegramClient(session, API_ID, API_HASH)
+
+
+async def _save_session_to_db():
+    """
+    Export the current in-memory session as a string and store it in MongoDB.
+    Called automatically after every successful /login so restarts don't need re-auth.
+    """
+    try:
+        from database import save_session_string
+        session_str = StringSession.save(userbot.session)
+        await save_session_string(session_str)
+        print("[userbot] Session string saved to MongoDB — future restarts will not require re-login")
+    except Exception as e:
+        print(f"[userbot] Could not save session to MongoDB: {e}")
 
 
 async def connect():
@@ -130,16 +159,15 @@ async def begin_listening():
         if not match:
             return
 
-        print(f"[userbot] ✅ New post in source channel — msg_id={event.message.id}")
+        print(f"[userbot] New post in source channel — msg_id={event.message.id}")
         await log_event("new_post", {"msg_id": event.message.id, "chat_id": chat_id})
 
-        # Extract ALL links from the post (supports 1 or 2 links)
         links = _extract_links(event.message)
         if not links:
-            print(f"[userbot] ⚠️ No links in post {event.message.id} — skipping")
+            print(f"[userbot] No links in post {event.message.id} — skipping")
             return
 
-        print(f"[userbot] 🔗 Extracted {len(links)} link(s): {links}")
+        print(f"[userbot] Extracted {len(links)} link(s): {links}")
 
         if _forward_callback:
             asyncio.create_task(_forward_callback(event.message, links))
@@ -223,7 +251,7 @@ async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0) -
     processed = 0
     for message, links in matched:
         if _scan_cancelled:
-            print(f"[userbot] scan: ⛔ cancelled by /stop after {processed} posts")
+            print(f"[userbot] scan: cancelled by /stop after {processed} posts")
             break
         print(f"[userbot] scan: msg {message.id} → {links}")
         if callback:
@@ -254,7 +282,7 @@ async def scan_range(source: str, start_id: int, end_id: int, callback) -> int:
     processed = 0
     for message, links in matched:
         if _scan_cancelled:
-            print(f"[userbot] scan_range: ⛔ cancelled after {processed} posts")
+            print(f"[userbot] scan_range: cancelled by /stop after {processed} posts")
             break
         print(f"[userbot] scan_range: msg {message.id} → {links}")
         if callback:
@@ -293,16 +321,14 @@ def _clean_url(url: str) -> str:
 def _extract_links(message) -> list:
     """
     Extract ALL Telegram bot/deep links from a message.
-    Returns a list of URL strings (may contain 1 or more links).
-    Deduplicates while preserving order.
+    Returns a deduplicated list of URL strings in order found.
     """
     text = (getattr(message, 'text', None) or
             getattr(message, 'message', None) or
             getattr(message, 'caption', None) or "")
 
-    seen = {}  # ordered dedup: url → True
+    seen = {}
 
-    # 1. Named-URL entities (MessageEntityTextUrl) — highest priority
     if message.entities:
         for entity in message.entities:
             if isinstance(entity, MessageEntityTextUrl):
@@ -311,18 +337,16 @@ def _extract_links(message) -> list:
                     seen[url] = True
             elif isinstance(entity, MessageEntityUrl):
                 start = entity.offset
-                end = entity.offset + entity.length
-                url = _clean_url(text[start:end])
+                end   = entity.offset + entity.length
+                url   = _clean_url(text[start:end])
                 if TG_LINK_RE.match(url):
                     seen[url] = True
 
-    # 2. Plain-text URLs in the message body
     for m in TG_LINK_RE.finditer(text):
         url = _clean_url(m.group(0))
         if url not in seen:
             seen[url] = True
 
-    # 3. Inline keyboard buttons (fallback)
     if not seen and message.reply_markup:
         try:
             for row in message.reply_markup.rows:
@@ -336,10 +360,7 @@ def _extract_links(message) -> list:
 
 
 def _extract_link(message) -> str | None:
-    """
-    Legacy single-link helper — returns the first TG link found, or None.
-    Kept for backward compatibility.
-    """
+    """Legacy single-link helper — returns the first link found, or None."""
     links = _extract_links(message)
     return links[0] if links else None
 
@@ -352,7 +373,7 @@ async def click_bot_link_and_get_files(link: str) -> list:
         return []
 
     bot_username = m.group(1)
-    start_param = m.group(2)
+    start_param  = m.group(2)
 
     async with userbot.conversation(bot_username, timeout=30) as conv:
         await conv.send_message(f"/start {start_param}")

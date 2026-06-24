@@ -29,7 +29,6 @@ def admin_only(func):
 # ─── /login conversation ────────────────────────────────────────────────────
 
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point — /login (no admin check; first-time setup before admins exist)."""
     import userbot.client as ub
 
     if await ub.is_authorized():
@@ -98,7 +97,6 @@ async def login_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     import userbot.client as ub
 
     password = update.message.text.strip()
-    # Delete the password message for security
     try:
         await update.message.delete()
     except Exception:
@@ -118,15 +116,18 @@ async def _finish_login(update: Update):
     import userbot.client as ub
 
     me = await ub.userbot.get_me()
-    name = me.first_name or ""
+    name     = me.first_name or ""
     username = f"@{me.username}" if me.username else str(me.id)
+
+    # ── Persist session so restarts don't require re-login ──────────────────
+    await ub._save_session_to_db()
 
     # Signal the userbot coroutine to start listening
     ub.login_done.set()
 
     await update.message.reply_text(
         f"✅ *Logged in as {name} ({username})*\n\n"
-        "Userbot is now active and listening for posts.\n"
+        "Userbot is now active. Session saved — no re-login needed after restarts.\n"
         "Use /enable after configuring channels to start automation.",
         parse_mode="Markdown",
     )
@@ -309,7 +310,6 @@ async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     await update_config("active", True)
-    # Auto-join the source channel so the userbot gets updates from it
     source = cfg.get("source_channel")
     await update.message.reply_text("⏳ Joining source channel…")
     await ub.join_source_channel(source)
@@ -329,7 +329,6 @@ async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stop any currently running /scan without disabling automation."""
     import userbot.client as ub
     ub.cancel_scan()
     await update.message.reply_text(
@@ -406,7 +405,6 @@ async def cmd_list_cmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_set_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set the message ID from which /scan should start fetching."""
     if not context.args:
         cfg = await get_config()
         current = cfg.get("scan_start_id", 0)
@@ -425,25 +423,16 @@ async def cmd_set_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update_config("scan_start_id", msg_id)
     if msg_id == 0:
-        await update.message.reply_text("✅ Scan start ID cleared. `/scan` will use message limit.", parse_mode="Markdown")
+        await update.message.reply_text("✅ Scan start ID cleared.", parse_mode="Markdown")
     else:
         await update.message.reply_text(
-            f"✅ Scan start ID set to `{msg_id}`.\n\n"
-            f"Running `/scan` will now fetch *all* messages after ID `{msg_id}` and process them.",
+            f"✅ Scan start ID set to `{msg_id}`.",
             parse_mode="Markdown",
         )
 
 
 @admin_only
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Scan source channel and process posts with bot links.
-
-    Modes:
-      /scan            — use saved start ID (if set), else last 50 posts
-      /scan 200        — last 200 posts (ignores start ID)
-      /scan from       — all messages after saved start ID
-    """
     import userbot.client as ub
     if not await ub.is_authorized():
         await update.message.reply_text("❌ Userbot not logged in. Use /login first.")
@@ -455,15 +444,12 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     saved_start_id = cfg.get("scan_start_id", 0) or 0
-
-    # Parse arguments
     min_id = 0
-    limit = 0
+    limit  = 0
 
     if context.args:
         arg = context.args[0].lower()
         if arg == "from":
-            # Fetch everything after the saved start ID
             if not saved_start_id:
                 await update.message.reply_text("❌ No start ID saved. Use /setstart <msg_id> first.")
                 return
@@ -475,34 +461,29 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Usage: /scan | /scan <limit> | /scan from")
                 return
     else:
-        # Default: use saved start ID if set, otherwise last 50
         if saved_start_id:
             min_id = saved_start_id
         else:
             limit = 50
 
-    # Build status message
     if min_id:
         desc = f"all posts after message ID `{min_id}`"
     else:
         desc = f"last *{limit}* posts"
 
     await update.message.reply_text(
-        f"🔍 Scanning {desc} in source channel…\n"
-        f"_(this may take a while for large ranges)_",
+        f"🔍 Scanning {desc} in source channel…\n_(use /stop to cancel at any time)_",
         parse_mode="Markdown",
     )
 
     from bot.processor import process_post
 
-    async def callback(message, link):
-        await process_post(message, link, ub.userbot, None)
+    async def callback(message, links):
+        await process_post(message, links, ub.userbot, None)
 
     count = await ub.scan_channel(source, callback, min_id=min_id, limit=limit)
 
-    # Auto-advance the start ID to the latest processed message
     if count > 0 and min_id:
-        # The scan processed up to the newest message; update start ID
         try:
             entity = await ub.userbot.get_entity(source)
             msgs = await ub.userbot.get_messages(entity, limit=1)
@@ -511,7 +492,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 new_start = msgs[0].id
                 await update.message.reply_text(
                     f"✅ Scan complete — *{count}* post(s) processed.\n"
-                    f"📌 Start ID auto-advanced to `{new_start}` (next `/scan from` continues from here).",
+                    f"📌 Start ID auto-advanced to `{new_start}`.",
                     parse_mode="Markdown",
                 )
                 return
@@ -519,15 +500,13 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     await update.message.reply_text(
-        f"✅ Scan complete — *{count}* post(s) with links processed.\n"
-        + (f"💡 Tip: use `/setstart <msg_id>` to set a start point for next time." if not min_id else ""),
+        f"✅ Scan complete — *{count}* post(s) with links processed.",
         parse_mode="Markdown",
     )
 
 
 @admin_only
 async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process a specific post by its message ID: /process <msg_id>"""
     import userbot.client as ub
     if not await ub.is_authorized():
         await update.message.reply_text("❌ Userbot not logged in. Use /login first.")
@@ -551,8 +530,8 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     from bot.processor import process_post
 
-    async def callback(message, link):
-        await process_post(message, link, ub.userbot, None)
+    async def callback(message, links):
+        await process_post(message, links, ub.userbot, None)
 
     found = await ub.process_single(source, msg_id, callback)
     if found:
@@ -563,10 +542,6 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_set_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /setlog <channel_id>  — set the log channel for processing summaries
-    /setlog off           — disable log channel
-    """
     if not context.args:
         cfg = await get_config()
         current = cfg.get("log_channel") or "not set"
@@ -583,96 +558,69 @@ async def cmd_set_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update_config("log_channel", val)
         await update.message.reply_text(
-            f"✅ Log channel set to `{val}`.\n\n"
-            "The bot will send a summary after each processed post.",
+            f"✅ Log channel set to `{val}`.",
             parse_mode="Markdown",
         )
 
 
 @admin_only
 async def cmd_set_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /settemplate <text>  — set a caption template appended to every output post.
-    Use {text} as a placeholder for the original post text.
-    Example:  /settemplate {text}\\n\\n📢 @MyChannel
-    """
     if not context.args:
         await update.message.reply_text(
             "Usage: `/settemplate <template>`\n\n"
             "Use `{text}` as a placeholder for the original post text.\n"
-            "If you omit `{text}`, the template is appended below the original.\n\n"
             "Example:\n`/settemplate {text}\\n\\n📢 Join @MyChannel`",
             parse_mode="Markdown",
         )
         return
-    # Join all args so spaces are preserved; unescape literal \n
     raw = " ".join(context.args).replace("\\n", "\n")
     await update_config("caption_template", raw)
     await update.message.reply_text(
-        f"✅ Caption template saved:\n\n`{raw}`\n\n"
-        "Use `/showtemplate` to review it, `/cleartemplate` to remove it.",
+        f"✅ Caption template saved:\n\n`{raw}`",
         parse_mode="Markdown",
     )
 
 
 @admin_only
 async def cmd_show_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show the current caption template."""
     cfg = await get_config()
     t = cfg.get("caption_template") or ""
     if t:
-        await update.message.reply_text(
-            f"📋 *Current caption template:*\n\n`{t}`", parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"📋 *Current caption template:*\n\n`{t}`", parse_mode="Markdown")
     else:
         await update.message.reply_text("ℹ️ No caption template set.")
 
 
 @admin_only
 async def cmd_clear_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove the caption template."""
     await update_config("caption_template", "")
     await update.message.reply_text("✅ Caption template cleared.")
 
 
 @admin_only
 async def cmd_set_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /setfilter on   — strip @usernames and t.me links from output posts
-    /setfilter off  — keep them (default)
-    /setfilter      — show current state
-    """
     if not context.args:
         cfg = await get_config()
         state = "🟢 ON" if cfg.get("strip_links") else "🔴 OFF"
         await update.message.reply_text(
             f"🔍 Link/username filter is currently *{state}*\n\n"
-            "Usage: `/setfilter on` or `/setfilter off`\n\n"
-            "When ON, all `@usernames` and `t.me/…` links (except the new generated link) "
-            "are removed from every output post.",
+            "Usage: `/setfilter on` or `/setfilter off`",
             parse_mode="Markdown",
         )
         return
     val = context.args[0].lower()
     if val == "on":
         await update_config("strip_links", True)
-        await update.message.reply_text(
-            "✅ Filter *ON* — @usernames and other t.me links will be stripped from output posts.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("✅ Filter *ON*.", parse_mode="Markdown")
     elif val == "off":
         await update_config("strip_links", False)
-        await update.message.reply_text("✅ Filter *OFF* — text posted as-is.", parse_mode="Markdown")
+        await update.message.reply_text("✅ Filter *OFF*.", parse_mode="Markdown")
     else:
         await update.message.reply_text("Usage: `/setfilter on` or `/setfilter off`", parse_mode="Markdown")
 
 
 @admin_only
 async def cmd_fbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /fbatch <start_msg_id> <end_msg_id>
-    Process all posts with bot links between two message IDs in the source channel.
-    """
     import userbot.client as ub
     if not await ub.is_authorized():
         await update.message.reply_text("❌ Userbot not logged in. Use /login first.")
@@ -680,8 +628,7 @@ async def cmd_fbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args or len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: `/fbatch <start_msg_id> <end_msg_id>`\n\n"
-            "Processes all posts with bot links between those two IDs (inclusive).",
+            "Usage: `/fbatch <start_msg_id> <end_msg_id>`",
             parse_mode="Markdown",
         )
         return
@@ -694,7 +641,7 @@ async def cmd_fbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if start_id > end_id:
-        start_id, end_id = end_id, start_id  # swap silently
+        start_id, end_id = end_id, start_id
 
     cfg = await get_config()
     source = cfg.get("source_channel")
@@ -704,14 +651,14 @@ async def cmd_fbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🔍 Scanning messages `{start_id}` → `{end_id}` in source channel…\n"
-        f"_(posts are processed one by one — use /stop to cancel)_",
+        f"_(use /stop or /disable to cancel at any time)_",
         parse_mode="Markdown",
     )
 
     from bot.processor import process_post
 
-    async def callback(message, link):
-        await process_post(message, link, ub.userbot, None)
+    async def callback(message, links):
+        await process_post(message, links, ub.userbot, None)
 
     count = await ub.scan_range(source, start_id, end_id, callback)
 
@@ -723,7 +670,6 @@ async def cmd_fbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_debugchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle debug logging of all incoming message chat IDs."""
     from database import get_config, update_config
     cfg = await get_config()
     current = cfg.get("debug_channel", False)
@@ -731,8 +677,7 @@ async def cmd_debugchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_config("debug_channel", new_val)
     state = "🟢 ON" if new_val else "🔴 OFF"
     await update.message.reply_text(
-        f"Debug channel logging is now *{state}*\n\n"
-        + ("All incoming message chat IDs will appear in logs. Send a message to your source channel, then check logs to verify the chat ID matches your /setsource value." if new_val else "Debug logging disabled."),
+        f"Debug channel logging is now *{state}*",
         parse_mode="Markdown",
     )
 
@@ -743,8 +688,8 @@ def register_handlers(app):
     login_conv = ConversationHandler(
         entry_points=[CommandHandler("login", cmd_login)],
         states={
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_got_phone)],
-            CODE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, login_got_code)],
+            PHONE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, login_got_phone)],
+            CODE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, login_got_code)],
             PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_got_password)],
         },
         fallbacks=[CommandHandler("cancel", login_cancel)],
@@ -752,28 +697,28 @@ def register_handlers(app):
     )
 
     app.add_handler(login_conv)
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("setsource", cmd_set_source))
-    app.add_handler(CommandHandler("setdb", cmd_set_db))
-    app.add_handler(CommandHandler("setoutput", cmd_set_output))
+    app.add_handler(CommandHandler("start",        cmd_start))
+    app.add_handler(CommandHandler("help",         cmd_help))
+    app.add_handler(CommandHandler("setsource",    cmd_set_source))
+    app.add_handler(CommandHandler("setdb",        cmd_set_db))
+    app.add_handler(CommandHandler("setoutput",    cmd_set_output))
     app.add_handler(CommandHandler("setsecondbot", cmd_set_second_bot))
-    app.add_handler(CommandHandler("addadmin", cmd_add_admin))
-    app.add_handler(CommandHandler("removeadmin", cmd_remove_admin))
-    app.add_handler(CommandHandler("enable", cmd_enable))
-    app.add_handler(CommandHandler("disable", cmd_disable))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("enablecmd", cmd_enable_cmd))
-    app.add_handler(CommandHandler("disablecmd", cmd_disable_cmd))
-    app.add_handler(CommandHandler("listcmds", cmd_list_cmds))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("setstart", cmd_set_start))
-    app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("fbatch", cmd_fbatch))
-    app.add_handler(CommandHandler("process", cmd_process))
-    app.add_handler(CommandHandler("setlog", cmd_set_log))
-    app.add_handler(CommandHandler("settemplate", cmd_set_template))
+    app.add_handler(CommandHandler("addadmin",     cmd_add_admin))
+    app.add_handler(CommandHandler("removeadmin",  cmd_remove_admin))
+    app.add_handler(CommandHandler("enable",       cmd_enable))
+    app.add_handler(CommandHandler("disable",      cmd_disable))
+    app.add_handler(CommandHandler("status",       cmd_status))
+    app.add_handler(CommandHandler("enablecmd",    cmd_enable_cmd))
+    app.add_handler(CommandHandler("disablecmd",   cmd_disable_cmd))
+    app.add_handler(CommandHandler("listcmds",     cmd_list_cmds))
+    app.add_handler(CommandHandler("stop",         cmd_stop))
+    app.add_handler(CommandHandler("setstart",     cmd_set_start))
+    app.add_handler(CommandHandler("scan",         cmd_scan))
+    app.add_handler(CommandHandler("fbatch",       cmd_fbatch))
+    app.add_handler(CommandHandler("process",      cmd_process))
+    app.add_handler(CommandHandler("setlog",       cmd_set_log))
+    app.add_handler(CommandHandler("settemplate",  cmd_set_template))
     app.add_handler(CommandHandler("showtemplate", cmd_show_template))
-    app.add_handler(CommandHandler("cleartemplate", cmd_clear_template))
-    app.add_handler(CommandHandler("setfilter", cmd_set_filter))
+    app.add_handler(CommandHandler("cleartemplate",cmd_clear_template))
+    app.add_handler(CommandHandler("setfilter",    cmd_set_filter))
     app.add_handler(CommandHandler("debugchannel", cmd_debugchannel))

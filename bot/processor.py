@@ -60,6 +60,20 @@ DELAY_BETWEEN_LINKS     = 6
 # Global semaphore: only ONE post processed at a time
 _processing_lock = asyncio.Lock()
 
+# Task object for whatever post is currently being processed. Cancelling it
+# raises CancelledError at whatever point it's suspended (including inside
+# conversation waits / send_file calls), so /stop takes effect immediately —
+# not just at the next checkpoint.
+_current_task: asyncio.Task | None = None
+
+
+def cancel_current_processing():
+    """Immediately cancel whatever post is currently being processed, if any."""
+    global _current_task
+    if _current_task and not _current_task.done():
+        print("[processor] Cancel requested — stopping current task immediately")
+        _current_task.cancel()
+
 
 # ── Cancellation helpers ──────────────────────────────────────────────────────
 
@@ -89,24 +103,43 @@ async def _sleep_cancellable(seconds: float, step: float = 0.5):
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-async def process_post(message: TelethonMessage, links, userbot, bot_app):
+async def process_post(messages, links, userbot, bot_app):
     """
     Process one source-channel post end-to-end.
+    `messages` is either a single Telethon Message or a list of Messages
+    (an album/media group — e.g. a post with more than one photo).
     `links` may be a single URL string or a list of URL strings.
     Queues behind _processing_lock so concurrent calls serialise.
     """
     if isinstance(links, str):
         links = [links]
+    if isinstance(messages, TelethonMessage):
+        messages = [messages]
+
+    global _current_task
+    primary_id = messages[0].id
 
     async with _processing_lock:
         if _is_cancelled():
-            print(f"[processor] /stop active — skipping post {message.id}")
+            print(f"[processor] /stop active — skipping post {primary_id}")
             return
-        await _process_post_inner(message, links, userbot, bot_app)
-        await _sleep_cancellable(DELAY_BETWEEN_POSTS)
+
+        task = asyncio.ensure_future(_process_post_inner(messages, links, userbot, bot_app))
+        _current_task = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            print(f"[processor] Post {primary_id} processing stopped by /stop")
+        finally:
+            if _current_task is task:
+                _current_task = None
+
+        if not _is_cancelled():
+            await _sleep_cancellable(DELAY_BETWEEN_POSTS)
 
 
-async def _process_post_inner(message: TelethonMessage, links: list, userbot, bot_app):
+async def _process_post_inner(messages: list, links: list, userbot, bot_app):
+    message = messages[0]
     cfg = await get_config()
     db_channel          = cfg.get("db_channel")
     output_channel      = cfg.get("output_channel")
@@ -218,7 +251,7 @@ async def _process_post_inner(message: TelethonMessage, links: list, userbot, bo
         return
 
     # ── Build and send output ─────────────────────────────────────────────────
-    processed_html = _message_to_html(message)
+    processed_html = _message_to_html(messages)
     for original_link, new_link in link_replacements:
         processed_html = _replace_link_in_html(processed_html, original_link, new_link)
 
@@ -233,7 +266,7 @@ async def _process_post_inner(message: TelethonMessage, links: list, userbot, bo
     final_html = _apply_template(processed_html, caption_template)
 
     first_new_link = link_replacements[0][1]
-    await _send_to_output(message, final_html, first_new_link, out_ch, userbot)
+    await _send_to_output(messages, final_html, first_new_link, out_ch, userbot)
 
     # ── Log summary ───────────────────────────────────────────────────────────
     pairs_text = "\n".join(f"  • `{ol}` → {nl}" for ol, nl in link_replacements)
@@ -259,15 +292,26 @@ async def _process_post_inner(message: TelethonMessage, links: list, userbot, bo
 
 # ── Text helpers ──────────────────────────────────────────────────────────────
 
-def _message_to_html(message: TelethonMessage) -> str:
-    raw_text = getattr(message, 'message', None) or getattr(message, 'text', None) or ""
-    entities = getattr(message, 'entities', None) or []
-    try:
-        if entities:
-            return tl_html.unparse(raw_text, entities)
-    except Exception:
-        pass
-    return raw_text
+def _message_to_html(messages) -> str:
+    """
+    Build the HTML caption for a post. `messages` may be a single message or
+    a list (album) — for albums, only one message usually carries the
+    caption/entities, so scan all of them and use the first one with text.
+    """
+    if isinstance(messages, TelethonMessage):
+        messages = [messages]
+    for message in messages:
+        raw_text = getattr(message, 'message', None) or getattr(message, 'text', None) or ""
+        if not raw_text:
+            continue
+        entities = getattr(message, 'entities', None) or []
+        try:
+            if entities:
+                return tl_html.unparse(raw_text, entities)
+        except Exception:
+            pass
+        return raw_text
+    return ""
 
 
 def _replace_link_in_html(html: str, original_link: str, new_link: str) -> str:
@@ -603,15 +647,24 @@ def _extract_url_from_response(resp) -> str | None:
     return None
 
 
-async def _send_to_output(original_msg, html_text: str, new_link: str, output_channel, userbot):
+async def _send_to_output(original_msgs, html_text: str, new_link: str, output_channel, userbot):
     """
     Send the processed post to the output channel.
+    `original_msgs` may be a single Telethon Message or a list (album).
+    When the source post has more than one photo/video, ALL of them are
+    sent together to the output channel as an album — not just one.
     Retries up to 3 times on FloodWait.
     Never falls back to a text-only message when the original had media —
     that would produce a broken/distorted post.
     """
-    print(f"[processor] Sending to output channel {output_channel}")
-    has_media = bool(original_msg.media)
+    if isinstance(original_msgs, TelethonMessage):
+        original_msgs = [original_msgs]
+
+    primary_id = original_msgs[0].id
+    media_list = [m.media for m in original_msgs if m.media]
+    has_media = bool(media_list)
+
+    print(f"[processor] Sending to output channel {output_channel} ({len(media_list)} media item(s))")
 
     for attempt in range(3):
         if _is_cancelled():
@@ -620,7 +673,7 @@ async def _send_to_output(original_msg, html_text: str, new_link: str, output_ch
             if has_media:
                 await userbot.send_file(
                     output_channel,
-                    file=original_msg.media,
+                    file=media_list if len(media_list) > 1 else media_list[0],
                     caption=html_text or None,
                     parse_mode="html",
                 )
@@ -642,7 +695,7 @@ async def _send_to_output(original_msg, html_text: str, new_link: str, output_ch
             if attempt < 2:
                 await _sleep_cancellable(15)
             else:
-                print(f"[processor] All output attempts failed — post {original_msg.id} skipped")
+                print(f"[processor] All output attempts failed — post {primary_id} skipped")
 
 
 async def _send_log(userbot, log_channel, text: str):

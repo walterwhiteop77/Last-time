@@ -24,6 +24,8 @@ async def get_config() -> dict:
             "active": False,
             "caption_template": "",
             "strip_links": False,
+            "keep_caption": True,
+            "text_rules": [],
         }
         await config_col.insert_one(doc)
     return doc

@@ -16,6 +16,7 @@ from bot.app import build_app
 from bot.processor import process_post
 import userbot.client as ub
 from config import PORT
+from database import get_config
 
 
 # ── Render health-check web server ────────────────────────────────────────────
@@ -51,6 +52,27 @@ async def _run_userbot() -> None:
 
 # ── Admin bot (python-telegram-bot) ──────────────────────────────────────────
 
+async def _notify_admins_restart(app) -> None:
+    """Send a restart notice to every configured admin. Non-fatal if it fails."""
+    try:
+        cfg = await get_config()
+        admins = cfg.get("admins", [])
+        if not admins:
+            print("[bot] No admins configured — skipping restart notification.")
+            return
+        for admin_id in admins:
+            try:
+                await app.bot.send_message(
+                    admin_id,
+                    "🔄 *Bot restarted* and is back online.",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                print(f"[bot] Could not notify admin {admin_id}: {e}")
+    except Exception as e:
+        print(f"[bot] Restart notification failed: {e}")
+
+
 async def _run_ptb(app) -> None:
     await app.initialize()
     try:
@@ -64,6 +86,7 @@ async def _run_ptb(app) -> None:
         allowed_updates=["message", "callback_query"],
     )
     print("[bot] Admin bot started. Send /login to authenticate the userbot.")
+    await _notify_admins_restart(app)
     await asyncio.Event().wait()
 
 

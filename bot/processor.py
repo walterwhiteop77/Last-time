@@ -114,6 +114,8 @@ async def _process_post_inner(message: TelethonMessage, links: list, userbot, bo
     log_channel         = cfg.get("log_channel")
     caption_template    = cfg.get("caption_template") or ""
     strip_links         = cfg.get("strip_links", False)
+    keep_caption        = cfg.get("keep_caption", True)
+    text_rules          = cfg.get("text_rules", [])
 
     if not all([db_channel, output_channel, second_bot_username]):
         print(f"[processor] Missing config — skipping post {message.id}")
@@ -172,7 +174,7 @@ async def _process_post_inner(message: TelethonMessage, links: list, userbot, bo
                 await _sleep_cancellable(DELAY_BETWEEN_COPIES)
                 if _is_cancelled():
                     return
-            msg_id = await _copy_to_db(userbot, db_ch, file_msg)
+            msg_id = await _copy_to_db(userbot, db_ch, file_msg, keep_caption)
             if msg_id:
                 db_msg_ids.append(msg_id)
                 print(f"[processor] Copied file {i+1}/{len(files)} → DB msg {msg_id}")
@@ -224,6 +226,9 @@ async def _process_post_inner(message: TelethonMessage, links: list, userbot, bo
         all_new   = [nl for _, nl in link_replacements]
         all_orig  = [ol for ol, _ in link_replacements]
         processed_html = _apply_filter(processed_html, keep_urls=all_new + all_orig)
+
+    if text_rules:
+        processed_html = _apply_text_rules(processed_html, text_rules)
 
     final_html = _apply_template(processed_html, caption_template)
 
@@ -301,6 +306,24 @@ def _apply_filter(html: str, keep_urls: list) -> str:
     return html.strip()
 
 
+def _apply_text_rules(html: str, rules: list) -> str:
+    """
+    Apply user-defined find/replace rules to the post text before sending.
+    Each rule is {"find": str, "replace": str}. An empty "replace" removes
+    the matched text entirely. Matching is plain substring (case-sensitive).
+    """
+    for rule in rules:
+        find = rule.get("find", "")
+        replace = rule.get("replace", "")
+        if not find:
+            continue
+        if find in html:
+            html = html.replace(find, replace)
+    html = re.sub(r" {2,}", " ", html)
+    html = re.sub(r"\n{3,}", "\n\n", html)
+    return html.strip()
+
+
 def _apply_template(text: str, template: str) -> str:
     if not template:
         return text
@@ -340,21 +363,26 @@ def _is_photo_or_video(media) -> bool:
     return False
 
 
-async def _copy_to_db(userbot, db_ch, file_msg) -> int | None:
+async def _copy_to_db(userbot, db_ch, file_msg, keep_caption: bool = True) -> int | None:
     """
     Copy one photo/video to the DB channel.
     Retries up to 3 times on FloodWaitError; skips non-photo/video media.
+    `keep_caption` controls whether the original file's caption is preserved
+    or stripped when forwarding into the DB channel.
     """
     if not _is_photo_or_video(file_msg.media):
         kind = type(file_msg.media).__name__ if file_msg.media else "text"
         print(f"[processor] Skipping non-photo/video media: {kind}")
         return None
 
-    text = (
-        getattr(file_msg, 'text', None) or
-        getattr(file_msg, 'message', None) or
-        getattr(file_msg, 'caption', None) or ""
-    )
+    if keep_caption:
+        text = (
+            getattr(file_msg, 'text', None) or
+            getattr(file_msg, 'message', None) or
+            getattr(file_msg, 'caption', None) or ""
+        )
+    else:
+        text = ""
 
     for attempt in range(3):
         try:

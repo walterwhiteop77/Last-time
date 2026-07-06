@@ -28,6 +28,7 @@ def admin_only(func):
 
 # ─── /login conversation ────────────────────────────────────────────────────
 
+@admin_only
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
 
@@ -45,6 +46,7 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PHONE
 
 
+@admin_only
 async def login_got_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
 
@@ -68,6 +70,7 @@ async def login_got_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CODE
 
 
+@admin_only
 async def login_got_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from telethon.errors import SessionPasswordNeededError
     import userbot.client as ub
@@ -93,6 +96,7 @@ async def login_got_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+@admin_only
 async def login_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
 
@@ -133,6 +137,7 @@ async def _finish_login(update: Update):
     )
 
 
+@admin_only
 async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ Login cancelled.")
@@ -198,6 +203,11 @@ HELP_TEXT = """
 /showtemplate — View current template
 /cleartemplate — Remove template
 /setfilter `on|off` — Strip @usernames & t\.me links from output
+/setcaption `keep|remove` — Keep or strip captions when copying files to the DB channel
+/addtextrule `<find> => <replace>` — Replace text in output posts (omit `=> replace` to remove it)
+/removetextrule `<index>` — Remove a text rule by its number
+/listtextrules — List all active text rules
+/cleartextrules — Remove all text rules
 
 ━━━━━━━━━━━━━━━━━━━━
 🔧 *Second Bot Commands*
@@ -213,6 +223,7 @@ HELP_TEXT = """
 """.strip()
 
 
+@admin_only
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
@@ -620,6 +631,114 @@ async def cmd_set_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_set_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        cfg = await get_config()
+        state = "🟢 KEEP" if cfg.get("keep_caption", True) else "🔴 REMOVE"
+        await update.message.reply_text(
+            f"📝 Caption on DB-channel copies is currently set to *{state}*\n\n"
+            "Usage: `/setcaption keep` or `/setcaption remove`",
+            parse_mode="Markdown",
+        )
+        return
+    val = context.args[0].lower()
+    if val in ("keep", "on"):
+        await update_config("keep_caption", True)
+        await update.message.reply_text("✅ Captions will be *kept* when copying files to the DB channel.", parse_mode="Markdown")
+    elif val in ("remove", "off", "strip"):
+        await update_config("keep_caption", False)
+        await update.message.reply_text("✅ Captions will be *removed* when copying files to the DB channel.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Usage: `/setcaption keep` or `/setcaption remove`", parse_mode="Markdown")
+
+
+@admin_only
+async def cmd_add_text_rule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/addtextrule <find> => <replace>`\n"
+            "Omit `=> <replace>` to remove the text entirely.\n\n"
+            "Examples:\n"
+            "`/addtextrule Join @OldChannel => Join @NewChannel`\n"
+            "`/addtextrule Powered by XYZ`",
+            parse_mode="Markdown",
+        )
+        return
+    raw = " ".join(context.args).replace("\\n", "\n")
+    if "=>" in raw:
+        find, replace = raw.split("=>", 1)
+        find, replace = find.strip(), replace.strip()
+    else:
+        find, replace = raw.strip(), ""
+
+    if not find:
+        await update.message.reply_text("❌ The text to find cannot be empty.")
+        return
+
+    cfg = await get_config()
+    rules = cfg.get("text_rules", [])
+    rules.append({"find": find, "replace": replace})
+    await update_config("text_rules", rules)
+
+    if replace:
+        await update.message.reply_text(
+            f"✅ Rule added: `{find}` → `{replace}`", parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Rule added: `{find}` will be *removed* from output posts.", parse_mode="Markdown"
+        )
+
+
+@admin_only
+async def cmd_remove_text_rule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: `/removetextrule <index>` — see `/listtextrules` for indexes.", parse_mode="Markdown")
+        return
+    try:
+        idx = int(context.args[0]) - 1
+    except ValueError:
+        await update.message.reply_text("❌ Index must be a number. See `/listtextrules`.", parse_mode="Markdown")
+        return
+
+    cfg = await get_config()
+    rules = cfg.get("text_rules", [])
+    if idx < 0 or idx >= len(rules):
+        await update.message.reply_text("❌ Invalid index. See `/listtextrules`.", parse_mode="Markdown")
+        return
+
+    removed = rules.pop(idx)
+    await update_config("text_rules", rules)
+    label = f"`{removed['find']}` → `{removed['replace']}`" if removed.get("replace") else f"`{removed['find']}` (remove)"
+    await update.message.reply_text(f"✅ Removed rule: {label}", parse_mode="Markdown")
+
+
+@admin_only
+async def cmd_list_text_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = await get_config()
+    rules = cfg.get("text_rules", [])
+    if not rules:
+        await update.message.reply_text("ℹ️ No text find/replace rules set.")
+        return
+    lines = []
+    for i, r in enumerate(rules, 1):
+        if r.get("replace"):
+            lines.append(f"{i}. `{r['find']}` → `{r['replace']}`")
+        else:
+            lines.append(f"{i}. `{r['find']}` → *(removed)*")
+    await update.message.reply_text(
+        "📋 *Text rules (applied to output posts):*\n" + "\n".join(lines),
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_clear_text_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update_config("text_rules", [])
+    await update.message.reply_text("✅ All text rules cleared.")
+
+
+@admin_only
 async def cmd_fbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
     if not await ub.is_authorized():
@@ -721,4 +840,9 @@ def register_handlers(app):
     app.add_handler(CommandHandler("showtemplate", cmd_show_template))
     app.add_handler(CommandHandler("cleartemplate",cmd_clear_template))
     app.add_handler(CommandHandler("setfilter",    cmd_set_filter))
+    app.add_handler(CommandHandler("setcaption",   cmd_set_caption))
+    app.add_handler(CommandHandler("addtextrule",     cmd_add_text_rule))
+    app.add_handler(CommandHandler("removetextrule",  cmd_remove_text_rule))
+    app.add_handler(CommandHandler("listtextrules",   cmd_list_text_rules))
+    app.add_handler(CommandHandler("cleartextrules",  cmd_clear_text_rules))
     app.add_handler(CommandHandler("debugchannel", cmd_debugchannel))

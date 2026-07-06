@@ -26,6 +26,11 @@ _scan_cancelled: bool = False
 def cancel_scan():
     global _scan_cancelled
     _scan_cancelled = True
+    try:
+        from bot.processor import cancel_current_processing
+        cancel_current_processing()
+    except Exception as e:
+        print(f"[userbot] Could not cancel in-flight processing: {e}")
 
 
 def reset_scan_cancel():
@@ -124,43 +129,52 @@ async def join_source_channel(source: str):
         print(f"[userbot] Note: could not join source channel ({e}) — may already be a member")
 
 
+async def _match_source_chat(event, cfg) -> bool:
+    """Return True if this event's chat matches the configured source channel."""
+    source = cfg.get("source_channel")
+    if not source:
+        return False
+
+    chat_id = event.chat_id
+    if cfg.get("debug_channel", False):
+        print(f"[userbot][debug] msg from chat_id={chat_id}")
+
+    source = str(source).strip()
+    try:
+        source_id = int(source)
+    except (TypeError, ValueError):
+        source_id = None
+
+    if source_id and chat_id == source_id:
+        return True
+
+    chat = await event.get_chat()
+    if hasattr(chat, "username") and chat.username:
+        if source.lstrip("@") == chat.username.lstrip("@"):
+            return True
+
+    return False
+
+
 async def begin_listening():
     """Register event handlers and run until disconnected."""
 
     @userbot.on(events.NewMessage())
     async def on_new_message(event):
+        # Messages that belong to an album (grouped_id set) are handled
+        # together by the Album handler below, so all photos get sent —
+        # skip them here to avoid processing the same post twice.
+        if event.message.grouped_id:
+            return
+
         cfg = await get_config()
         if not cfg.get("active"):
             return
-        source = cfg.get("source_channel")
-        if not source:
-            return
-
-        chat_id = event.chat_id
-
-        if cfg.get("debug_channel", False):
-            print(f"[userbot][debug] msg from chat_id={chat_id}")
-
-        source = str(source).strip()
-        try:
-            source_id = int(source)
-        except (TypeError, ValueError):
-            source_id = None
-
-        chat = await event.get_chat()
-
-        match = False
-        if source_id and chat_id == source_id:
-            match = True
-        elif hasattr(chat, "username") and chat.username:
-            if source.lstrip("@") == chat.username.lstrip("@"):
-                match = True
-
-        if not match:
+        if not await _match_source_chat(event, cfg):
             return
 
         print(f"[userbot] New post in source channel — msg_id={event.message.id}")
-        await log_event("new_post", {"msg_id": event.message.id, "chat_id": chat_id})
+        await log_event("new_post", {"msg_id": event.message.id, "chat_id": event.chat_id})
 
         links = _extract_links(event.message)
         if not links:
@@ -171,6 +185,38 @@ async def begin_listening():
 
         if _forward_callback:
             asyncio.create_task(_forward_callback(event.message, links))
+
+    @userbot.on(events.Album())
+    async def on_new_album(event):
+        cfg = await get_config()
+        if not cfg.get("active"):
+            return
+        if not await _match_source_chat(event, cfg):
+            return
+
+        messages = event.messages
+        print(f"[userbot] New album in source channel — {len(messages)} photo(s), first msg_id={messages[0].id}")
+        await log_event("new_post", {
+            "msg_id": messages[0].id,
+            "chat_id": event.chat_id,
+            "album_size": len(messages),
+        })
+
+        links = []
+        for m in messages:
+            found = _extract_links(m)
+            if found:
+                links = found
+                break
+
+        if not links:
+            print(f"[userbot] No links in album {messages[0].id} — skipping")
+            return
+
+        print(f"[userbot] Extracted {len(links)} link(s) from album: {links}")
+
+        if _forward_callback:
+            asyncio.create_task(_forward_callback(messages, links))
 
     print("[userbot] Authorized and listening for new posts.")
     await userbot.run_until_disconnected()
@@ -222,6 +268,40 @@ async def _resolve_entity(source: str):
         )
 
 
+def _group_by_album(messages: list) -> list:
+    """
+    Group a chronologically-ordered list of messages so that consecutive
+    messages sharing the same non-null grouped_id (i.e. an album/media
+    group with multiple photos) end up together. Returns a list of groups,
+    where each group is itself a list of one or more messages.
+    """
+    groups = []
+    current = []
+    current_gid = None
+    for m in messages:
+        gid = getattr(m, "grouped_id", None)
+        if gid is not None and gid == current_gid:
+            current.append(m)
+        else:
+            if current:
+                groups.append(current)
+            current = [m]
+            current_gid = gid
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _links_for_group(group: list) -> list:
+    """Return links found on ANY message in the group (albums usually carry
+    the caption/links on just one message of the group)."""
+    for m in group:
+        found = _extract_links(m)
+        if found:
+            return found
+    return []
+
+
 async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0) -> int:
     try:
         entity = await _resolve_entity(source)
@@ -238,24 +318,29 @@ async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0) -
     else:
         print(f"[userbot] scan: fetching last {limit} messages")
 
-    matched = []
+    all_messages = []
     async for message in userbot.iter_messages(entity, **kwargs):
-        links = _extract_links(message)
-        if links:
-            matched.append((message, links))
+        all_messages.append(message)
+    all_messages.reverse()
 
-    matched.reverse()
+    groups = _group_by_album(all_messages)
+    matched = []
+    for group in groups:
+        links = _links_for_group(group)
+        if links:
+            matched.append((group, links))
+
     print(f"[userbot] scan: {len(matched)} posts with links (oldest→newest)")
 
     reset_scan_cancel()
     processed = 0
-    for message, links in matched:
+    for group, links in matched:
         if _scan_cancelled:
             print(f"[userbot] scan: cancelled by /stop after {processed} posts")
             break
-        print(f"[userbot] scan: msg {message.id} → {links}")
+        print(f"[userbot] scan: msg {group[0].id} ({len(group)} photo(s)) → {links}")
         if callback:
-            await callback(message, links)
+            await callback(group, links)
         processed += 1
 
     return processed
@@ -269,24 +354,29 @@ async def scan_range(source: str, start_id: int, end_id: int, callback) -> int:
         return 0
 
     print(f"[userbot] scan_range: fetching messages {start_id}–{end_id}")
-    matched = []
+    all_messages = []
     async for message in userbot.iter_messages(entity, min_id=start_id - 1, max_id=end_id):
-        links = _extract_links(message)
-        if links:
-            matched.append((message, links))
+        all_messages.append(message)
+    all_messages.reverse()
 
-    matched.reverse()
+    groups = _group_by_album(all_messages)
+    matched = []
+    for group in groups:
+        links = _links_for_group(group)
+        if links:
+            matched.append((group, links))
+
     print(f"[userbot] scan_range: {len(matched)} post(s) with links")
 
     reset_scan_cancel()
     processed = 0
-    for message, links in matched:
+    for group, links in matched:
         if _scan_cancelled:
             print(f"[userbot] scan_range: cancelled by /stop after {processed} posts")
             break
-        print(f"[userbot] scan_range: msg {message.id} → {links}")
+        print(f"[userbot] scan_range: msg {group[0].id} ({len(group)} photo(s)) → {links}")
         if callback:
-            await callback(message, links)
+            await callback(group, links)
         processed += 1
 
     return processed
@@ -296,14 +386,25 @@ async def process_single(source: str, msg_id: int, callback) -> bool:
     try:
         entity = await _resolve_entity(source)
         messages = await userbot.get_messages(entity, ids=[msg_id])
-        if not messages:
+        if not messages or not messages[0]:
             return False
         message = messages[0]
-        links = _extract_links(message)
+
+        group = [message]
+        grouped_id = getattr(message, "grouped_id", None)
+        if grouped_id is not None:
+            # Fetch a small window around the message to pick up its album siblings.
+            window = await userbot.get_messages(entity, min_id=msg_id - 10, max_id=msg_id + 10)
+            siblings = [m for m in window if getattr(m, "grouped_id", None) == grouped_id]
+            if siblings:
+                siblings.sort(key=lambda m: m.id)
+                group = siblings
+
+        links = _links_for_group(group)
         if not links:
             return False
         if callback:
-            asyncio.create_task(callback(message, links))
+            asyncio.create_task(callback(group, links))
         return True
     except Exception as e:
         print(f"[userbot] process_single error: {e}")

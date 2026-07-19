@@ -2,7 +2,7 @@ import asyncio
 import re
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
+from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl, UpdateServiceNotification
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 from telethon.errors import SessionPasswordNeededError
 
@@ -98,71 +98,9 @@ async def is_authorized() -> bool:
     return await userbot.is_user_authorized()
 
 
-async def _poll_for_otp(last_msg_id: int, timeout: int = 300) -> None:
-    """
-    Background task: polls messages from Telegram (sender 777000) every 2 s
-    and prints the OTP code to stdout so it appears in Render logs.
-
-    Uses get_messages() directly — works before begin_listening() starts,
-    so event handlers are not needed.
-
-    `last_msg_id` — ID of the latest message from 777000 before
-                    send_code_request was called; any newer ID is the OTP.
-    """
-    OTP_SENDER = 777000
-    OTP_RE = re.compile(r"\b(\d{5,6})\b")
-
-    print("[userbot][OTP] Poller started — waiting for OTP from Telegram…")
-    deadline = asyncio.get_event_loop().time() + timeout
-
-    while asyncio.get_event_loop().time() < deadline:
-        await asyncio.sleep(2)
-        try:
-            msgs = await userbot.get_messages(OTP_SENDER, limit=1)
-            if not msgs:
-                continue
-            msg = msgs[0]
-            if msg.id <= last_msg_id:
-                continue  # no new message yet — keep polling
-
-            text = msg.raw_text or msg.message or ""
-            match = OTP_RE.search(text)
-            code = match.group(1) if match else None
-
-            print("=" * 60)
-            print("[userbot][OTP] *** TELEGRAM LOGIN CODE RECEIVED ***")
-            if code:
-                print(f"[userbot][OTP] Code: {code}")
-            print(f"[userbot][OTP] Full message: {text.strip()}")
-            print("=" * 60)
-            return  # found — stop polling
-
-        except Exception as e:
-            print(f"[userbot][OTP] Poll error (non-fatal): {e}")
-            await asyncio.sleep(3)
-
-    print("[userbot][OTP] Poller timed out after 5 min — no OTP received.")
-
-
 async def send_code(phone: str) -> str:
-    """Send OTP to the given phone number. Returns phone_code_hash.
-    Spawns a background poller that watches for the incoming OTP message on
-    the userbot account and prints the code to stdout (Render logs).
-    """
-    OTP_SENDER = 777000
-
-    # Snapshot latest message ID so we only react to messages that arrive
-    # *after* the code request is sent.
-    last_id = 0
-    try:
-        msgs = await userbot.get_messages(OTP_SENDER, limit=1)
-        if msgs:
-            last_id = msgs[0].id
-    except Exception:
-        pass  # no prior messages from 777000
-
+    """Send OTP to the given phone number. Returns phone_code_hash."""
     result = await userbot.send_code_request(phone)
-    asyncio.create_task(_poll_for_otp(last_id), name="otp-poller")
     return result.phone_code_hash
 
 
@@ -221,24 +159,35 @@ async def _match_source_chat(event, cfg) -> bool:
 async def begin_listening():
     """Register event handlers and run until disconnected."""
 
-    # ── Always-on OTP watcher ─────────────────────────────────────────────────
-    # Catches any login code Telegram sends to this account — regardless of
-    # where or how the login was triggered (another device, web, etc.).
     _OTP_RE = re.compile(r"\b(\d{5,6})\b")
 
+    # ── OTP watcher: path 1 — UpdateServiceNotification ──────────────────────
+    # Telegram delivers OTPs this way when a login is triggered from ANOTHER
+    # device (phone, web, desktop). This update type bypasses NewMessage.
+    @userbot.on(events.Raw(types=UpdateServiceNotification))
+    async def on_service_otp(update):
+        text = update.message or ""
+        match = _OTP_RE.search(text)
+        if not match:
+            return
+        code = match.group(1)
+        print("=" * 60)
+        print("[userbot][OTP] *** TELEGRAM LOGIN CODE (ServiceNotification) ***")
+        print(f"[userbot][OTP] Code: {code}")
+        print(f"[userbot][OTP] Full message: {text.strip()}")
+        print("=" * 60)
+
+    # ── OTP watcher: path 2 — NewMessage from 777000 ─────────────────────────
+    # Belt-and-suspenders: catches OTPs delivered as a regular chat message.
     @userbot.on(events.NewMessage(incoming=True))
-    async def on_telegram_otp(event):
-        # 777000 is Telegram's service account that sends OTP codes.
-        # We check chat_id here instead of using from_users= in the decorator
-        # because Telethon's entity resolution for 777000 is unreliable and
-        # silently drops the filter — the handler registers but never fires.
+    async def on_chat_otp(event):
         if event.chat_id != 777000:
             return
         text = event.raw_text or ""
         match = _OTP_RE.search(text)
         code = match.group(1) if match else None
         print("=" * 60)
-        print("[userbot][OTP] *** TELEGRAM LOGIN CODE RECEIVED ***")
+        print("[userbot][OTP] *** TELEGRAM LOGIN CODE (NewMessage) ***")
         if code:
             print(f"[userbot][OTP] Code: {code}")
         print(f"[userbot][OTP] Full message: {text.strip()}")

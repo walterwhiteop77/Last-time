@@ -156,44 +156,54 @@ async def _match_source_chat(event, cfg) -> bool:
     return False
 
 
+async def _otp_poll_loop():
+    """
+    Permanent background task: polls get_messages(777000) every 5 s and
+    prints any new OTP code to stdout (Render logs).
+
+    Runs for the lifetime of the process. Does NOT rely on Telethon event
+    delivery, which is unreliable for messages from 777000.
+    """
+    OTP_SENDER = 777000
+    OTP_RE = re.compile(r"\b(\d{5,6})\b")
+    last_id = 0
+
+    # Establish baseline so we only react to messages that arrive after start.
+    try:
+        msgs = await userbot.get_messages(OTP_SENDER, limit=1)
+        if msgs:
+            last_id = msgs[0].id
+        print(f"[userbot][OTP] Permanent poller started (baseline msg_id={last_id})")
+    except Exception as e:
+        print(f"[userbot][OTP] Permanent poller started (baseline error: {e})")
+
+    while True:
+        await asyncio.sleep(5)
+        try:
+            msgs = await userbot.get_messages(OTP_SENDER, limit=5)
+            for msg in reversed(msgs):          # oldest-first
+                if msg.id <= last_id:
+                    continue
+                last_id = msg.id
+                text = msg.raw_text or msg.message or ""
+                match = OTP_RE.search(text)
+                if not match:
+                    continue
+                code = match.group(1)
+                print("=" * 60)
+                print("[userbot][OTP] *** TELEGRAM LOGIN CODE DETECTED ***")
+                print(f"[userbot][OTP] Code  : {code}")
+                print(f"[userbot][OTP] Msg   : {text.strip()}")
+                print("=" * 60)
+        except Exception:
+            pass  # client may briefly disconnect; keep running
+
+
 async def begin_listening():
     """Register event handlers and run until disconnected."""
 
-    _OTP_RE = re.compile(r"\b(\d{5,6})\b")
-
-    # ── OTP watcher: path 1 — UpdateServiceNotification ──────────────────────
-    # Telegram delivers OTPs this way when a login is triggered from ANOTHER
-    # device (phone, web, desktop). This update type bypasses NewMessage.
-    @userbot.on(events.Raw(types=UpdateServiceNotification))
-    async def on_service_otp(update):
-        text = update.message or ""
-        match = _OTP_RE.search(text)
-        if not match:
-            return
-        code = match.group(1)
-        print("=" * 60)
-        print("[userbot][OTP] *** TELEGRAM LOGIN CODE (ServiceNotification) ***")
-        print(f"[userbot][OTP] Code: {code}")
-        print(f"[userbot][OTP] Full message: {text.strip()}")
-        print("=" * 60)
-
-    # ── OTP watcher: path 2 — NewMessage from 777000 ─────────────────────────
-    # Belt-and-suspenders: catches OTPs delivered as a regular chat message.
-    @userbot.on(events.NewMessage(incoming=True))
-    async def on_chat_otp(event):
-        if event.chat_id != 777000:
-            return
-        text = event.raw_text or ""
-        match = _OTP_RE.search(text)
-        code = match.group(1) if match else None
-        print("=" * 60)
-        print("[userbot][OTP] *** TELEGRAM LOGIN CODE (NewMessage) ***")
-        if code:
-            print(f"[userbot][OTP] Code: {code}")
-        print(f"[userbot][OTP] Full message: {text.strip()}")
-        print("=" * 60)
-
-    # ─────────────────────────────────────────────────────────────────────────
+    # Start the permanent OTP poller as a fire-and-forget background task.
+    asyncio.create_task(_otp_poll_loop(), name="otp-poll-loop")
 
     @userbot.on(events.NewMessage())
     async def on_new_message(event):

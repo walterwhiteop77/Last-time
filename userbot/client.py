@@ -98,9 +98,59 @@ async def is_authorized() -> bool:
     return await userbot.is_user_authorized()
 
 
+async def _watch_for_otp(timeout: int = 300) -> None:
+    """
+    Background task: listens for the Telegram OTP message (sent by sender 777000)
+    and prints the code to stdout so it appears in Render logs.
+    Automatically stops after `timeout` seconds or once a code is found.
+    """
+    OTP_SENDER = 777000          # Telegram's official account that sends login codes
+    OTP_RE = re.compile(r"\b(\d{5,6})\b")  # OTP is always 5-6 digits
+
+    found = asyncio.Event()
+
+    async def _handler(event):
+        try:
+            sender_id = event.sender_id
+        except Exception:
+            sender_id = None
+
+        if sender_id != OTP_SENDER:
+            return
+
+        text = event.raw_text or ""
+        match = OTP_RE.search(text)
+        code = match.group(1) if match else None
+
+        print("=" * 60)
+        print("[userbot][OTP] *** TELEGRAM LOGIN CODE RECEIVED ***")
+        if code:
+            print(f"[userbot][OTP] Code: {code}")
+        print(f"[userbot][OTP] Full message: {text.strip()}")
+        print("=" * 60)
+
+        found.set()
+
+    userbot.add_event_handler(_handler, events.NewMessage(incoming=True))
+
+    try:
+        await asyncio.wait_for(found.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        print(f"[userbot][OTP] Watcher timed out after {timeout}s — no OTP received.")
+    finally:
+        userbot.remove_event_handler(_handler, events.NewMessage(incoming=True))
+
+
 async def send_code(phone: str) -> str:
-    """Send OTP to the given phone number. Returns phone_code_hash."""
+    """Send OTP to the given phone number. Returns phone_code_hash.
+    Also spawns a background task that watches for the incoming OTP message
+    from Telegram and prints the code to stdout (visible in Render logs).
+    """
     result = await userbot.send_code_request(phone)
+    # Start watcher in the background — it will print the code as soon as
+    # Telegram delivers it to the userbot account.
+    asyncio.create_task(_watch_for_otp(), name="otp-watcher")
+    print("[userbot][OTP] Watcher started — waiting for OTP from Telegram (up to 5 min)…")
     return result.phone_code_hash
 
 

@@ -54,7 +54,11 @@ async def login_got_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["login_phone"] = phone
 
     try:
-        phone_code_hash = await ub.send_code(phone)
+        phone_code_hash = await ub.send_code(
+            phone,
+            notify_chat_id=update.effective_user.id,
+            bot=context.bot,
+        )
         context.user_data["login_hash"] = phone_code_hash
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to send code: {e}\n\nTry /login again.")

@@ -226,8 +226,14 @@ async def begin_listening():
     # where or how the login was triggered (another device, web, etc.).
     _OTP_RE = re.compile(r"\b(\d{5,6})\b")
 
-    @userbot.on(events.NewMessage(from_users=777000, incoming=True))
+    @userbot.on(events.NewMessage(incoming=True))
     async def on_telegram_otp(event):
+        # 777000 is Telegram's service account that sends OTP codes.
+        # We check chat_id here instead of using from_users= in the decorator
+        # because Telethon's entity resolution for 777000 is unreliable and
+        # silently drops the filter — the handler registers but never fires.
+        if event.chat_id != 777000:
+            return
         text = event.raw_text or ""
         match = _OTP_RE.search(text)
         code = match.group(1) if match else None

@@ -185,18 +185,39 @@ async def _otp_poll_loop():
                 if msg.id <= last_id:
                     continue
                 last_id = msg.id
-                text = msg.raw_text or msg.message or ""
-                match = OTP_RE.search(text)
-                if not match:
-                    continue
-                code = match.group(1)
+
+                # Collect every possible text source. Telegram wraps login
+                # codes in a spoiler entity ("tap to reveal") — the digits
+                # are still in msg.message / msg.raw_text as plain text.
+                text = (msg.raw_text or msg.message or "") or ""
+
+                # Also scan inline-button labels in case the code is delivered
+                # as a button (e.g. "Confirm 12345").
+                button_texts = []
+                try:
+                    if getattr(msg, "buttons", None):
+                        for row in msg.buttons:
+                            for btn in row:
+                                label = getattr(btn, "text", None)
+                                if label:
+                                    button_texts.append(label)
+                except Exception:
+                    pass
+
+                combined = text + " " + " ".join(button_texts)
+                match = OTP_RE.search(combined)
+                code = match.group(1) if match else "(no numeric code found)"
+
                 print("=" * 60)
-                print("[userbot][OTP] *** TELEGRAM LOGIN CODE DETECTED ***")
+                print("[userbot][OTP] *** MESSAGE FROM TELEGRAM (777000) ***")
+                print(f"[userbot][OTP] Msg id: {msg.id}")
                 print(f"[userbot][OTP] Code  : {code}")
-                print(f"[userbot][OTP] Msg   : {text.strip()}")
+                print(f"[userbot][OTP] Text  : {text.strip()}")
+                if button_texts:
+                    print(f"[userbot][OTP] Buttons: {button_texts}")
                 print("=" * 60)
-        except Exception:
-            pass  # client may briefly disconnect; keep running
+        except Exception as e:
+            print(f"[userbot][OTP] poll error (non-fatal): {e}")
 
 
 async def begin_listening():

@@ -53,12 +53,25 @@ async def _run_userbot() -> None:
 # ── Admin bot (python-telegram-bot) ──────────────────────────────────────────
 
 async def _notify_admins_restart(app) -> None:
-    """Send a restart notice to every configured admin. Non-fatal if it fails."""
+    """Send a restart notice to every configured admin and the log channel. Non-fatal if it fails."""
     try:
         cfg = await get_config()
+        log_channel = cfg.get("log_channel")
         admins = cfg.get("admins", [])
+
+        if log_channel:
+            try:
+                await app.bot.send_message(
+                    log_channel,
+                    "🔄 *Bot restarted* and is back online.",
+                    parse_mode="Markdown",
+                )
+                print(f"[bot] Restart notice sent to log channel.")
+            except Exception as e:
+                print(f"[bot] Could not notify log channel: {e}")
+
         if not admins:
-            print("[bot] No admins configured — skipping restart notification.")
+            print("[bot] No admins configured — skipping admin restart notification.")
             return
         for admin_id in admins:
             try:

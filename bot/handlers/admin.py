@@ -148,11 +148,27 @@ async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     await update.message.reply_text(
         "👋 *TG Automation Bot*\n\n"
         "Send /help to see all admin commands.",
         parse_mode="Markdown",
     )
+    try:
+        cfg = await get_config()
+        log_channel = cfg.get("log_channel")
+        if log_channel and user:
+            name = user.full_name or user.username or f"`{user.id}`"
+            await context.bot.send_message(
+                log_channel,
+                f"👤 *New bot user started the bot*\n"
+                f"• Name: `{name}`\n"
+                f"• ID: `{user.id}`\n"
+                f"• Username: `@{user.username or 'none'}`",
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        print(f"[bot] Could not log new user start: {e}")
 
 
 HELP_TEXT = """

@@ -363,6 +363,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         authorized = "❓ Unknown"
     cmds = cfg.get("enabled_commands", [])
     cmd_list = ", ".join(cmds) if cmds else "none"
+    caption_state = "🟢 KEEP" if cfg.get("keep_caption", False) else "🔴 REMOVE"
     text = (
         f"*Bot Status*: {active}\n"
         f"*Userbot*: {authorized}\n\n"
@@ -370,6 +371,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💾 DB channel: `{cfg.get('db_channel') or 'not set'}`\n"
         f"📤 Output channel: `{cfg.get('output_channel') or 'not set'}`\n"
         f"🤖 Second bot: `{cfg.get('second_bot_username') or 'not set'}`\n"
+        f"📝 DB caption: *{caption_state}* (`/setcaption keep|remove`)\n"
         f"👥 Admins: `{cfg.get('admins', [])}`\n"
         f"🔧 Enabled commands: `{cmd_list}`\n"
     )

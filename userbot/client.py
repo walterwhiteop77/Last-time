@@ -4,7 +4,6 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
-from telethon.errors import SessionPasswordNeededError
 
 import sys
 import os
@@ -91,11 +90,19 @@ async def _save_session_to_db():
 
 async def connect():
     """Connect to Telegram without authenticating."""
+    if userbot is None:
+        raise RuntimeError("init_client() must be called before connect()")
     await userbot.connect()
 
 
 async def is_authorized() -> bool:
-    return await userbot.is_user_authorized()
+    if userbot is None:
+        return False
+    try:
+        return await userbot.is_user_authorized()
+    except Exception as e:
+        print(f"[userbot] is_authorized check failed: {e}")
+        return False
 
 
 async def send_code(phone: str) -> str:
@@ -173,6 +180,10 @@ async def begin_listening():
         if not await _match_source_chat(event, cfg):
             return
 
+        # A previous /stop only cancels scans — live posts resume from here.
+        if _scan_cancelled:
+            reset_scan_cancel()
+
         print(f"[userbot] New post in source channel — msg_id={event.message.id}")
         await log_event("new_post", {"msg_id": event.message.id, "chat_id": event.chat_id})
 
@@ -193,6 +204,9 @@ async def begin_listening():
             return
         if not await _match_source_chat(event, cfg):
             return
+
+        if _scan_cancelled:
+            reset_scan_cancel()
 
         messages = event.messages
         print(f"[userbot] New album in source channel — {len(messages)} photo(s), first msg_id={messages[0].id}")
@@ -394,7 +408,7 @@ async def process_single(source: str, msg_id: int, callback) -> bool:
         grouped_id = getattr(message, "grouped_id", None)
         if grouped_id is not None:
             # Fetch a small window around the message to pick up its album siblings.
-            window = await userbot.get_messages(entity, min_id=msg_id - 10, max_id=msg_id + 10)
+            window = await userbot.get_messages(entity, limit=40, min_id=msg_id - 10, max_id=msg_id + 10)
             siblings = [m for m in window if getattr(m, "grouped_id", None) == grouped_id]
             if siblings:
                 siblings.sort(key=lambda m: m.id)
@@ -430,8 +444,9 @@ def _extract_links(message) -> list:
 
     seen = {}
 
-    if message.entities:
-        for entity in message.entities:
+    entities = getattr(message, "entities", None) or []
+    if entities:
+        for entity in entities:
             if isinstance(entity, MessageEntityTextUrl):
                 url = _clean_url(entity.url)
                 if TG_LINK_RE.match(url):
@@ -448,7 +463,7 @@ def _extract_links(message) -> list:
         if url not in seen:
             seen[url] = True
 
-    if not seen and message.reply_markup:
+    if not seen and getattr(message, "reply_markup", None):
         try:
             for row in message.reply_markup.rows:
                 for btn in row.buttons:

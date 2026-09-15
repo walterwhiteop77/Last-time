@@ -202,7 +202,7 @@ HELP_TEXT = """
 /settemplate `<text>` — Caption template (`{text}` = original)
 /showtemplate — View current template
 /cleartemplate — Remove template
-/setfilter `on|off` — Strip @usernames & t\.me links from output
+/setfilter `on|off` — Strip @usernames & t.me links from output
 /setcaption `keep|remove` — Keep or strip captions when copying files to the DB channel
 /addtextrule `<find> => <replace>` — Replace text in output posts (omit `=> replace` to remove it)
 /removetextrule `<index>` — Remove a text rule by its number
@@ -312,6 +312,9 @@ async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ub.is_authorized():
         await update.message.reply_text("❌ Userbot is not logged in. Use /login first.")
         return
+    # Clear any leftover cancel flag from a previous /stop or /disable,
+    # otherwise every new post would be silently skipped.
+    ub.reset_scan_cancel()
     cfg = await get_config()
     missing = [k for k in ["source_channel", "db_channel", "output_channel", "second_bot_username"] if not cfg.get(k)]
     if missing:

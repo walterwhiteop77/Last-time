@@ -26,10 +26,9 @@ from telethon.tl.types import (
     Message as TelethonMessage,
     MessageMediaPhoto,
     MessageMediaDocument,
-    DocumentAttributeVideo,
+    MessageMediaWebPage,
     DocumentAttributeSticker,
-    DocumentAttributeAnimated,
-    DocumentAttributeAudio,
+    DocumentAttributeFilename,
 )
 from telethon.errors import FloodWaitError
 from telethon.extensions import html as tl_html
@@ -391,32 +390,67 @@ def _make_msg_link(db_channel: str, msg_id: int) -> str:
         return f"https://t.me/{username}/{msg_id}"
 
 
-def _is_photo_or_video(media) -> bool:
+def _is_supported_media(media) -> bool:
+    """
+    True for anything worth storing in the DB channel: photos, videos,
+    audio, and documents of any kind (mkv/mp4/zip/pdf…).
+    Only link previews and stickers are skipped.
+    """
     if media is None:
+        return False
+    if isinstance(media, MessageMediaWebPage):
         return False
     if isinstance(media, MessageMediaPhoto):
         return True
     if isinstance(media, MessageMediaDocument):
-        attrs     = getattr(media.document, "attributes", [])
-        attr_types = {type(a) for a in attrs}
-        if DocumentAttributeVideo not in attr_types:
-            return False
-        if attr_types & {DocumentAttributeSticker, DocumentAttributeAnimated, DocumentAttributeAudio}:
+        attrs = getattr(getattr(media, "document", None), "attributes", []) or []
+        if any(isinstance(a, DocumentAttributeSticker) for a in attrs):
             return False
         return True
     return False
 
 
+def _media_filename(file_msg) -> str | None:
+    doc = getattr(getattr(file_msg, "media", None), "document", None)
+    for attr in getattr(doc, "attributes", []) or []:
+        if isinstance(attr, DocumentAttributeFilename):
+            return attr.file_name
+    return None
+
+
+async def _resolve_target(userbot, chat):
+    """
+    Resolve a channel id/@username into an entity Telethon can send to.
+    A bare -100… id fails with "Cannot find any entity" unless it is cached,
+    so fall back to the dialog-walking resolver in userbot.client.
+    """
+    try:
+        return await userbot.get_entity(chat)
+    except Exception:
+        pass
+    try:
+        import userbot.client as _ub
+        return await _ub._resolve_entity(str(chat))
+    except Exception as e:
+        print(f"[processor] Could not resolve channel {chat}: {e}")
+        return None
+
+
 async def _copy_to_db(userbot, db_ch, file_msg, keep_caption: bool = True) -> int | None:
     """
-    Copy one photo/video to the DB channel.
-    Retries up to 3 times on FloodWaitError; skips non-photo/video media.
-    `keep_caption` controls whether the original file's caption is preserved
-    or stripped when forwarding into the DB channel.
+    Copy one file (photo, video, audio or document) to the DB channel.
+    Tries to re-send by reference first; if the sending bot protects its
+    content, downloads the file and re-uploads it instead.
+    Retries up to 3 times on FloodWaitError.
     """
-    if not _is_photo_or_video(file_msg.media):
+    if not _is_supported_media(file_msg.media):
         kind = type(file_msg.media).__name__ if file_msg.media else "text"
-        print(f"[processor] Skipping non-photo/video media: {kind}")
+        print(f"[processor] Skipping unsupported media: {kind}")
+        return None
+
+    target = await _resolve_target(userbot, db_ch)
+    if target is None:
+        print(f"[processor] DB channel {db_ch} unreachable — is the userbot a member/admin?")
         return None
 
     if keep_caption:
@@ -429,9 +463,11 @@ async def _copy_to_db(userbot, db_ch, file_msg, keep_caption: bool = True) -> in
         text = ""
 
     for attempt in range(3):
+        if _is_cancelled():
+            return None
         try:
             sent = await userbot.send_file(
-                db_ch,
+                target,
                 file=file_msg.media,
                 caption=text or None,
                 parse_mode="html",
@@ -444,12 +480,48 @@ async def _copy_to_db(userbot, db_ch, file_msg, keep_caption: bool = True) -> in
             if _is_cancelled():
                 return None
         except Exception as e:
-            print(f"[processor] DB copy failed (attempt {attempt + 1}/3): {e}")
+            print(f"[processor] DB copy by reference failed (attempt {attempt + 1}/3): {e}")
+            msg_id = await _copy_to_db_via_download(userbot, target, file_msg, text)
+            if msg_id:
+                return msg_id
             if attempt < 2:
                 await _sleep_cancellable(10)
             else:
                 return None
     return None
+
+
+async def _copy_to_db_via_download(userbot, target, file_msg, caption: str) -> int | None:
+    """
+    Fallback used when a file cannot be re-sent by reference (for example when
+    the source bot enables content protection): download it, then upload it.
+    """
+    try:
+        print("[processor] Falling back to download + re-upload…")
+        data = await userbot.download_media(file_msg, file=bytes)
+        if not data:
+            print("[processor] Download returned nothing")
+            return None
+        name = _media_filename(file_msg) or f"file_{file_msg.id}"
+        from io import BytesIO
+        buf = BytesIO(data)
+        buf.name = name
+        sent = await userbot.send_file(
+            target,
+            file=buf,
+            caption=caption or None,
+            parse_mode="html",
+            force_document=bool(_media_filename(file_msg)),
+        )
+        print(f"[processor] Re-uploaded '{name}' → DB msg {sent.id}")
+        return sent.id
+    except FloodWaitError as e:
+        print(f"[processor] FloodWait during re-upload — waiting {e.seconds + 5}s")
+        await _sleep_cancellable(e.seconds + 5)
+        return None
+    except Exception as e:
+        print(f"[processor] Download + re-upload failed: {e}")
+        return None
 
 
 # ── File collection ───────────────────────────────────────────────────────────
@@ -476,12 +548,12 @@ async def _get_files_from_link(link: str, userbot) -> list:
             await conv.send_message(cmd)
             print(f"[processor]   → sent: {cmd}")
 
-            deadline = asyncio.get_event_loop().time() + 20
+            deadline = asyncio.get_event_loop().time() + 45
             while asyncio.get_event_loop().time() < deadline:
                 if _is_cancelled():
                     break
                 try:
-                    resp = await asyncio.wait_for(conv.get_response(), timeout=5)
+                    resp = await asyncio.wait_for(conv.get_response(), timeout=10)
                     has_media = bool(resp.media)
                     preview   = repr((getattr(resp, 'text', '') or '')[:80])
                     print(f"[processor]   ← media={has_media} text={preview}")
@@ -635,7 +707,7 @@ def _extract_url_from_response(resp) -> str | None:
     match = URL_RE.search(text)
     if match:
         return match.group(0)
-    if resp.reply_markup:
+    if getattr(resp, "reply_markup", None):
         try:
             for row in resp.reply_markup.rows:
                 for btn in row.buttons:
@@ -666,20 +738,25 @@ async def _send_to_output(original_msgs, html_text: str, new_link: str, output_c
 
     print(f"[processor] Sending to output channel {output_channel} ({len(media_list)} media item(s))")
 
+    target = await _resolve_target(userbot, output_channel)
+    if target is None:
+        print(f"[processor] Output channel {output_channel} unreachable — post {primary_id} skipped")
+        return
+
     for attempt in range(3):
         if _is_cancelled():
             return
         try:
             if has_media:
                 await userbot.send_file(
-                    output_channel,
+                    target,
                     file=media_list if len(media_list) > 1 else media_list[0],
                     caption=html_text or None,
                     parse_mode="html",
                 )
             else:
                 await userbot.send_message(
-                    output_channel,
+                    target,
                     html_text,
                     parse_mode="html",
                     link_preview=True,

@@ -88,6 +88,12 @@ async def reset_delays() -> None:
     await update_config("delays", dict(DEFAULT_DELAYS))
 
 
+async def set_all_delays(seconds: float) -> None:
+    """Apply the same value to every delay step (see /setalldelay)."""
+    delays = {k: seconds for k in DEFAULT_DELAYS}
+    await update_config("delays", delays)
+
+
 # ── Multi-account sessions ────────────────────────────────────────────────────
 
 async def get_sessions() -> list:

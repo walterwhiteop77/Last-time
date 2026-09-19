@@ -273,6 +273,7 @@ HELP_TEXT = """
 ━━━━━━━━━━━━━━━━━━━━
 /delays — Show all waiting times
 /setdelay `<name> <seconds>` — Change one
+/setalldelay `<seconds>` — Same wait for all steps
 /resetdelays — Back to recommended values
 """.strip()
 
@@ -1145,6 +1146,35 @@ async def cmd_reset_delays(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Waiting times restored to the recommended defaults.")
 
 
+@admin_only
+async def cmd_set_all_delays(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from database import set_all_delays
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/setalldelay <seconds>`\nApplies the same wait to every step.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        seconds = float(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ The value must be a number of seconds.")
+        return
+    if seconds < 0 or seconds > 600:
+        await update.message.reply_text("❌ Please choose a value between 0 and 600 seconds.")
+        return
+    if seconds < 1:
+        await update.message.reply_text(
+            "⚠️ Very short waits raise the risk of Telegram temporarily blocking the account."
+        )
+    await set_all_delays(seconds)
+    await update.message.reply_text(
+        f"✅ All waiting times set to *{seconds}s*.\n"
+        "Fine-tune a single step with `/setdelay`, or restore defaults with `/resetdelays`.",
+        parse_mode="Markdown",
+    )
+
+
 # ─── Handler registration ────────────────────────────────────────────────────
 
 def register_handlers(app):
@@ -1203,4 +1233,5 @@ def register_handlers(app):
     app.add_handler(CommandHandler("setmode",        cmd_set_mode))
     app.add_handler(CommandHandler("delays",         cmd_delays))
     app.add_handler(CommandHandler("setdelay",       cmd_set_delay))
+    app.add_handler(CommandHandler("setalldelay",    cmd_set_all_delays))
     app.add_handler(CommandHandler("resetdelays",    cmd_reset_delays))

@@ -38,6 +38,7 @@ from telethon.tl.types import (
     MessageMediaWebPage,
     DocumentAttributeSticker,
     DocumentAttributeFilename,
+    DocumentAttributeVideo,
 )
 from telethon.errors import FloodWaitError
 from telethon.extensions import html as tl_html
@@ -463,6 +464,41 @@ def _media_filename(msg) -> str | None:
     return None
 
 
+def _is_video(msg) -> bool:
+    """True when the message media is a video (attribute or mime type)."""
+    media = getattr(msg, "media", None)
+    doc = getattr(media, "document", None)
+    if doc is None:
+        return False
+    attrs = getattr(doc, "attributes", []) or []
+    if any(isinstance(a, DocumentAttributeVideo) for a in attrs):
+        return True
+    mime = (getattr(doc, "mime_type", "") or "").lower()
+    return mime.startswith("video/")
+
+
+def _video_attributes(msg) -> list:
+    """
+    Rebuild video attributes (duration, size, streaming) for re-upload so the
+    video shows as a playable/streamable video instead of a plain file.
+    """
+    media = getattr(msg, "media", None)
+    doc = getattr(media, "document", None)
+    out = []
+    for a in (getattr(doc, "attributes", []) or []):
+        if isinstance(a, DocumentAttributeVideo):
+            out.append(DocumentAttributeVideo(
+                round_message=False,
+                supports_streaming=True,
+                duration=getattr(a, "duration", 0) or 0,
+                w=getattr(a, "w", 0) or 0,
+                h=getattr(a, "h", 0) or 0,
+            ))
+        elif isinstance(a, DocumentAttributeFilename):
+            out.append(a)
+    return out
+
+
 async def _resolve_target(client, chat):
     try:
         return await client.get_entity(chat)
@@ -563,14 +599,17 @@ async def _upload_via_download(client, worker, target, file_msg, caption: str, d
         if _is_cancelled():
             return None
 
-        force_doc = bool(_media_filename(file_msg))
+        is_video = _is_video(file_msg)
+        force_doc = bool(_media_filename(file_msg)) and not is_video
+        extra_attrs = _video_attributes(file_msg) if is_video else None
         sent = await client.send_file(
             target,
             file=path,
             caption=caption or None,
             parse_mode="html",
             force_document=force_doc,
-            supports_streaming=not force_doc,
+            supports_streaming=is_video or not force_doc,
+            attributes=extra_attrs,
         )
         print(f"[processor] Uploaded → DB msg {sent.id}")
         return sent.id
@@ -870,11 +909,15 @@ async def _send_to_output(original_msgs, html_text: str, new_link: str, output_c
                 return
             try:
                 if need_download and paths:
+                    # Re-upload videos as playable videos, not plain files.
+                    any_video = any(_is_video(m) for m in media_msgs)
                     await client.send_file(
                         target,
                         file=paths if len(paths) > 1 else paths[0],
                         caption=html_text or None,
                         parse_mode="html",
+                        force_document=False,
+                        supports_streaming=any_video,
                     )
                 elif has_media:
                     media_list = [m.media for m in media_msgs]

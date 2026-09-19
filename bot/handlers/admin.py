@@ -30,16 +30,15 @@ def admin_only(func):
 
 @admin_only
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import userbot.client as ub
+    """Log in an ADDITIONAL userbot account (the pool can hold many)."""
+    import userbot.pool as pool
 
-    if await ub.is_authorized():
-        await update.message.reply_text("✅ Userbot is already logged in.")
-        return ConversationHandler.END
-
+    count = len(pool.live_accounts())
     await update.message.reply_text(
-        "📱 *Userbot Login*\n\n"
-        "Send your Telegram phone number with country code.\n"
-        "Example: `+91XXXXXXXXXX`\n\n"
+        "📱 *Add a userbot account*\n\n"
+        f"Accounts already in the pool: `{count}`\n\n"
+        "Send the Telegram phone number of the account you want to add, "
+        "with country code.\nExample: `+91XXXXXXXXXX`\n\n"
         "Send /cancel to abort.",
         parse_mode="Markdown",
     )
@@ -117,28 +116,44 @@ async def login_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def _finish_login(update: Update):
+    import userbot.pool as pool
     import userbot.client as ub
+    from telethon.tl.functions.channels import JoinChannelRequest
 
-    me = await ub.userbot.get_me()
-    name     = me.first_name or ""
-    username = f"@{me.username}" if me.username else str(me.id)
+    acc = await pool.finish_login()
 
-    # ── Persist session so restarts don't require re-login ──────────────────
-    await ub._save_session_to_db()
+    cfg = await get_config()
+    targets = [t for t in (cfg.get("source_channel"), cfg.get("db_channel"),
+                           cfg.get("output_channel")) if t]
+    joined = ""
+    for t in targets:
+        try:
+            entity = await acc.client.get_entity(str(t))
+            try:
+                await acc.client(JoinChannelRequest(entity))
+            except Exception:
+                pass
+        except Exception:
+            pass
+    if targets:
+        joined = "\nThis account was also subscribed to your configured channels."
 
-    # Signal the userbot coroutine to start listening
     ub.login_done.set()
 
     await update.message.reply_text(
-        f"✅ *Logged in as {name} ({username})*\n\n"
-        "Userbot is now active. Session saved — no re-login needed after restarts.\n"
-        "Use /enable after configuring channels to start automation.",
+        f"✅ *Account added: {acc.label}* (number `{acc.index}` in the pool)\n\n"
+        f"Accounts now ready: `{len(pool.live_accounts())}`\n"
+        "Session saved — no re-login needed after restarts."
+        f"{joined}\n\n"
+        "Use `/accounts` to see the pool, or `/login` again to add one more.",
         parse_mode="Markdown",
     )
 
 
 @admin_only
 async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import userbot.pool as pool
+    pool.cancel_login()
     context.user_data.clear()
     await update.message.reply_text("❌ Login cancelled.")
     return ConversationHandler.END
@@ -175,9 +190,17 @@ HELP_TEXT = """
 🤖 *TG Automation Bot — Admin Commands*
 
 ━━━━━━━━━━━━━━━━━━━━
-🔑 *Authentication*
+🔑 *Accounts (multi-login)*
 ━━━━━━━━━━━━━━━━━━━━
-/login — Log in the userbot account
+/login — Add another userbot account
+/accounts — List accounts & their state
+/removeaccount `<n>` — Remove an account
+/pauseaccount `<n>` — Stop giving it work
+/resumeaccount `<n>` — Use it again
+/setlistener `<n>` — Account that watches the source
+/setlinkaccount `<n>` — Account that talks to the second bot
+/rotate `on|off` — Spread work across accounts
+/joinall — Subscribe all accounts to your channels
 
 ━━━━━━━━━━━━━━━━━━━━
 📌 *Channel Setup*
@@ -236,6 +259,21 @@ HELP_TEXT = """
 🐛 *Debug*
 ━━━━━━━━━━━━━━━━━━━━
 /debugchannel — Toggle chat ID logging
+
+━━━━━━━━━━━━━━━━━━━━
+📦 *Restricted content*
+━━━━━━━━━━━━━━━━━━━━
+/setmode `auto|download|copy` — How files are saved
+  • auto — copy, switch to download+upload if saving is blocked
+  • download — always download then upload (protected files)
+  • copy — always re-send by reference
+
+━━━━━━━━━━━━━━━━━━━━
+⏱ *Speed / rate limits*
+━━━━━━━━━━━━━━━━━━━━
+/delays — Show all waiting times
+/setdelay `<name> <seconds>` — Change one
+/resetdelays — Back to recommended values
 """.strip()
 
 
@@ -380,9 +418,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmds = cfg.get("enabled_commands", [])
     cmd_list = ", ".join(cmds) if cmds else "none"
     caption_state = "🟢 KEEP" if cfg.get("keep_caption", False) else "🔴 REMOVE"
+    import userbot.pool as pool
+    from database import get_delays
+    delays = await get_delays()
+    acc_count = len(pool.live_accounts())
+    mode = (cfg.get("save_mode") or "auto").lower()
+    rotate = "on" if cfg.get("rotate_accounts", True) else "off"
     text = (
         f"*Bot Status*: {active}\n"
-        f"*Userbot*: {authorized}\n\n"
+        f"*Userbot*: {authorized} (`{acc_count}` account(s), rotation {rotate})\n\n"
         f"📥 Source channel: `{cfg.get('source_channel') or 'not set'}`\n"
         f"💾 DB channel: `{cfg.get('db_channel') or 'not set'}`\n"
         f"📤 Output channel: `{cfg.get('output_channel') or 'not set'}`\n"
@@ -390,6 +434,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📝 DB caption: *{caption_state}* (`/setcaption keep|remove`)\n"
         f"👥 Admins: `{cfg.get('admins', [])}`\n"
         f"🔧 Enabled commands: `{cmd_list}`\n"
+        f"📦 Save mode: `{mode}` (`/setmode`)\n"
+        f"⏱ Post gap: `{delays['between_posts']}s` · file gap: `{delays['between_copies']}s` (`/delays`)\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -822,6 +868,283 @@ async def cmd_debugchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+
+# ─── Multi-account pool management ───────────────────────────────────────────
+
+@admin_only
+async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import userbot.pool as pool
+    cfg = await get_config()
+    if not pool.accounts:
+        await update.message.reply_text(
+            "ℹ️ No userbot accounts yet. Send /login to add one."
+        )
+        return
+    lines = []
+    for acc in pool.accounts:
+        lines.append(await acc.status_line())
+    listener = cfg.get("listener_index", 1)
+    linkacc  = cfg.get("link_account_index", 1)
+    rotate   = "🟢 ON" if cfg.get("rotate_accounts", True) else "🔴 OFF"
+    await update.message.reply_text(
+        "👥 *Userbot accounts*\n" + "\n".join(lines) +
+        f"\n\n👁 Listener: account `{listener}`"
+        f"\n🔗 Link generator: account `{linkacc}`"
+        f"\n🔁 Rotation: *{rotate}*\n\n"
+        "`/login` add • `/removeaccount <n>` • `/pauseaccount <n>` • "
+        "`/resumeaccount <n>` • `/setlistener <n>` • `/setlinkaccount <n>` • "
+        "`/rotate on|off` • `/joinall`",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_remove_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import userbot.pool as pool
+    if not context.args:
+        await update.message.reply_text("Usage: `/removeaccount <number>` — see /accounts", parse_mode="Markdown")
+        return
+    try:
+        idx = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ The account number must be a number.")
+        return
+    ok = await pool.remove_account(idx)
+    await update.message.reply_text(
+        f"✅ Account `{idx}` removed from the pool." if ok else "❌ No account with that number.",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_pause_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import userbot.pool as pool
+    if not context.args:
+        await update.message.reply_text("Usage: `/pauseaccount <number>`", parse_mode="Markdown")
+        return
+    try:
+        idx = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ The account number must be a number.")
+        return
+    ok = await pool.set_enabled(idx, False)
+    await update.message.reply_text(
+        f"⏸ Account `{idx}` paused — it will not receive work." if ok else "❌ No account with that number.",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_resume_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import userbot.pool as pool
+    if not context.args:
+        await update.message.reply_text("Usage: `/resumeaccount <number>`", parse_mode="Markdown")
+        return
+    try:
+        idx = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ The account number must be a number.")
+        return
+    ok = await pool.set_enabled(idx, True)
+    await update.message.reply_text(
+        f"▶️ Account `{idx}` resumed." if ok else "❌ No account with that number.",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_set_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import userbot.pool as pool
+    if not context.args:
+        cfg = await get_config()
+        await update.message.reply_text(
+            f"👁 Listener is account `{cfg.get('listener_index', 1)}`.\n"
+            "Usage: `/setlistener <number>` (restart the bot to apply)",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        idx = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ The account number must be a number.")
+        return
+    if pool.get_account(idx) is None:
+        await update.message.reply_text("❌ No account with that number. See /accounts")
+        return
+    await update_config("listener_index", idx)
+    await update.message.reply_text(
+        f"✅ Account `{idx}` will watch the source channel.\n"
+        "_Restart the service so the change takes effect._",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_set_link_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import userbot.pool as pool
+    if not context.args:
+        cfg = await get_config()
+        await update.message.reply_text(
+            f"🔗 Link generation runs on account `{cfg.get('link_account_index', 1)}`.\n"
+            "Usage: `/setlinkaccount <number>`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        idx = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ The account number must be a number.")
+        return
+    if pool.get_account(idx) is None:
+        await update.message.reply_text("❌ No account with that number. See /accounts")
+        return
+    await update_config("link_account_index", idx)
+    await update.message.reply_text(
+        f"✅ Account `{idx}` will talk to the second bot. "
+        "Make sure that account is allowed to use it.",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_rotate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = await get_config()
+    if not context.args:
+        state = "🟢 ON" if cfg.get("rotate_accounts", True) else "🔴 OFF"
+        await update.message.reply_text(
+            f"🔁 Account rotation is *{state}*\n\n"
+            "With rotation ON the work is spread over all accounts, which keeps "
+            "each one far below Telegram's limits.\n"
+            "Usage: `/rotate on` or `/rotate off`",
+            parse_mode="Markdown",
+        )
+        return
+    val = context.args[0].lower()
+    if val in ("on", "yes", "true"):
+        await update_config("rotate_accounts", True)
+        await update.message.reply_text("✅ Rotation *ON* — work is shared across all accounts.", parse_mode="Markdown")
+    elif val in ("off", "no", "false"):
+        await update_config("rotate_accounts", False)
+        await update.message.reply_text("✅ Rotation *OFF* — everything runs on the listener account.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Usage: `/rotate on` or `/rotate off`", parse_mode="Markdown")
+
+
+@admin_only
+async def cmd_joinall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import userbot.client as ub
+    cfg = await get_config()
+    targets = [cfg.get("source_channel"), cfg.get("db_channel"), cfg.get("output_channel")]
+    targets = [t for t in targets if t]
+    if not targets:
+        await update.message.reply_text("❌ No channels configured yet.")
+        return
+    await update.message.reply_text("⏳ Subscribing every account to your channels…")
+    report = await ub.join_all_accounts(targets)
+    lines = []
+    for label, results in report.items():
+        lines.append(f"*{label}*")
+        lines.extend(f"  • {r}" for r in results)
+    await update.message.reply_text("\n".join(lines) or "Nothing to do.", parse_mode="Markdown")
+
+
+# ─── Restricted-content (save) mode ──────────────────────────────────────────
+
+@admin_only
+async def cmd_set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = await get_config()
+    mode = (cfg.get("save_mode") or "auto").lower()
+    labels = {
+        "auto":     "🤖 AUTO — copy normally, switch to download+upload when saving is blocked",
+        "download": "⬇️ DOWNLOAD — always download the file and upload it again",
+        "copy":     "⚡ COPY — always re-send by reference (fails on protected files)",
+    }
+    if not context.args:
+        await update.message.reply_text(
+            f"📦 *Save mode*: {labels.get(mode, mode)}\n\n"
+            "Usage: `/setmode auto` • `/setmode download` • `/setmode copy`\n\n"
+            "Use *download* when the source bot or channel has "
+            "“restrict saving content” turned on — the file is fetched to the "
+            "server and uploaded to your DB channel as a fresh file.",
+            parse_mode="Markdown",
+        )
+        return
+    val = context.args[0].lower()
+    if val in ("auto", "download", "copy"):
+        await update_config("save_mode", val)
+        await update.message.reply_text(f"✅ Save mode set to: {labels[val]}", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Usage: `/setmode auto|download|copy`", parse_mode="Markdown")
+
+
+# ─── Timing / rate-limit pacing ──────────────────────────────────────────────
+
+DELAY_LABELS = {
+    "between_copies":    "between two files saved to the DB channel",
+    "after_copy_batch":  "after all files of one link are saved",
+    "conversation_step": "between two messages sent to a bot",
+    "between_links":     "between two links in the same post",
+    "between_posts":     "between two posts",
+    "account_cooldown":  "rest for an account after a job",
+}
+
+
+@admin_only
+async def cmd_delays(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from database import get_delays
+    delays = await get_delays()
+    lines = [f"`{k}` = *{delays[k]}s* — {DELAY_LABELS.get(k, '')}" for k in DELAY_LABELS]
+    await update.message.reply_text(
+        "⏱ *Waiting times*\n" + "\n".join(lines) +
+        "\n\nChange one: `/setdelay between_posts 5`\nRestore defaults: `/resetdelays`",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_set_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from database import set_delay, get_delays
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/setdelay <name> <seconds>`\nSee `/delays` for the names.",
+            parse_mode="Markdown",
+        )
+        return
+    key = context.args[0].lower()
+    if key not in DELAY_LABELS:
+        await update.message.reply_text(
+            "❌ Unknown name. Valid: " + ", ".join(f"`{k}`" for k in DELAY_LABELS),
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        seconds = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ The value must be a number of seconds.")
+        return
+    if seconds < 0 or seconds > 600:
+        await update.message.reply_text("❌ Please choose a value between 0 and 600 seconds.")
+        return
+    if seconds < 1:
+        await update.message.reply_text(
+            "⚠️ Very short waits raise the risk of Telegram temporarily blocking the account."
+        )
+    await set_delay(key, seconds)
+    delays = await get_delays()
+    await update.message.reply_text(
+        f"✅ `{key}` set to *{delays[key]}s* — {DELAY_LABELS[key]}.",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_reset_delays(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from database import reset_delays
+    await reset_delays()
+    await update.message.reply_text("✅ Waiting times restored to the recommended defaults.")
+
+
 # ─── Handler registration ────────────────────────────────────────────────────
 
 def register_handlers(app):
@@ -867,3 +1190,17 @@ def register_handlers(app):
     app.add_handler(CommandHandler("listtextrules",   cmd_list_text_rules))
     app.add_handler(CommandHandler("cleartextrules",  cmd_clear_text_rules))
     app.add_handler(CommandHandler("debugchannel", cmd_debugchannel))
+    # multi-account pool
+    app.add_handler(CommandHandler("accounts",       cmd_accounts))
+    app.add_handler(CommandHandler("removeaccount",  cmd_remove_account))
+    app.add_handler(CommandHandler("pauseaccount",   cmd_pause_account))
+    app.add_handler(CommandHandler("resumeaccount",  cmd_resume_account))
+    app.add_handler(CommandHandler("setlistener",    cmd_set_listener))
+    app.add_handler(CommandHandler("setlinkaccount", cmd_set_link_account))
+    app.add_handler(CommandHandler("rotate",         cmd_rotate))
+    app.add_handler(CommandHandler("joinall",        cmd_joinall))
+    # restricted content + pacing
+    app.add_handler(CommandHandler("setmode",        cmd_set_mode))
+    app.add_handler(CommandHandler("delays",         cmd_delays))
+    app.add_handler(CommandHandler("setdelay",       cmd_set_delay))
+    app.add_handler(CommandHandler("resetdelays",    cmd_reset_delays))

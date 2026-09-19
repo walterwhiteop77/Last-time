@@ -1,27 +1,36 @@
 """
-Core automation logic — strictly sequential, rate-limit-safe.
+Core automation logic — sequential per post, rate-limit-safe, multi-account.
 
 Pipeline for each post:
-  1. Extract deep links from source-channel post (1 or 2 links supported)
+  1. Extract deep links from the source-channel post (1 or more)
   2. For EACH link independently:
-     a. Open link via userbot → collect files from linked bot
-     b. Copy files to DB channel one by one with delays
-     c. Build DB channel message links
-     d. Ask second bot for a new shareable link
+     a. Pick the next free userbot account from the pool (rotation)
+     b. Open the link with that account → collect files from the linked bot
+     c. Store the files in the DB channel:
+          • normal mode      → re-send by file reference (fast, no traffic)
+          • restricted mode  → download to disk, then upload again
+            (used when the source bot has forwarding/saving disabled)
+     d. Build DB channel message links
+     e. Ask the second bot for a new shareable link (link account)
   3. Replace ALL original links with their new counterparts in the post HTML
   4. Strip @usernames / other t.me links (if filter enabled)
   5. Apply caption template (if set)
-  6. Send ONE modified post to output channel
-  7. Send summary to log channel (if set)
-  8. Save mapping, wait before next post
+  6. Send ONE modified post to the output channel
+  7. Send a summary to the log channel (if set)
+  8. Save the mapping, pause, then continue with the next post
+
+Every wait is configurable at runtime with /setdelay — see database.DEFAULT_DELAYS.
 
 Stop/disable behaviour:
-  - _scan_cancelled flag is checked inside every sleep via _sleep_cancellable()
-  - At most 0.5 s after /stop or /disable the current step will abort
+  - the cancel flag is checked inside every sleep via _sleep_cancellable()
+  - at most 0.5 s after /stop or /disable the current step aborts
 """
 
 import asyncio
+import os
 import re
+import tempfile
+
 from telethon.tl.types import (
     Message as TelethonMessage,
     MessageMediaPhoto,
@@ -33,10 +42,11 @@ from telethon.tl.types import (
 from telethon.errors import FloodWaitError
 from telethon.extensions import html as tl_html
 
-import sys, os
+import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from database import get_config, save_file_mapping, log_event
+from database import get_config, get_delays, save_file_mapping, log_event
+import userbot.pool as pool
 
 # ── Regex helpers ─────────────────────────────────────────────────────────────
 TG_DEEP_LINK_RE = re.compile(
@@ -49,20 +59,8 @@ URL_RE    = re.compile(r"https?://[^\s]+")
 TG_URL_RE = re.compile(r"https?://(?:t\.me|telegram\.me)/\S+")
 AT_RE     = re.compile(r"@\w{3,}")
 
-# ── Delay settings (seconds) ─────────────────────────────────────────────────
-DELAY_BETWEEN_COPIES    = 4
-DELAY_AFTER_COPY_BATCH  = 5
-DELAY_CONVERSATION_STEP = 3
-DELAY_BETWEEN_POSTS     = 8
-DELAY_BETWEEN_LINKS     = 6
-
-# Global semaphore: only ONE post processed at a time
+# Only ONE post processed at a time
 _processing_lock = asyncio.Lock()
-
-# Task object for whatever post is currently being processed. Cancelling it
-# raises CancelledError at whatever point it's suspended (including inside
-# conversation waits / send_file calls), so /stop takes effect immediately —
-# not just at the next checkpoint.
 _current_task: asyncio.Task | None = None
 
 
@@ -77,7 +75,6 @@ def cancel_current_processing():
 # ── Cancellation helpers ──────────────────────────────────────────────────────
 
 def _is_cancelled() -> bool:
-    """Check whether /stop or /disable has been requested."""
     try:
         import userbot.client as _ub
         return _ub._scan_cancelled
@@ -86,11 +83,6 @@ def _is_cancelled() -> bool:
 
 
 async def _sleep_cancellable(seconds: float, step: float = 0.5):
-    """
-    Drop-in replacement for asyncio.sleep that respects the cancel flag.
-    Wakes every `step` seconds to check; at most `step` s after /stop
-    the current operation will abort.
-    """
     elapsed = 0.0
     while elapsed < seconds:
         if _is_cancelled():
@@ -100,13 +92,59 @@ async def _sleep_cancellable(seconds: float, step: float = 0.5):
         elapsed += chunk
 
 
+# ── Account helpers ───────────────────────────────────────────────────────────
+
+async def _pick_worker(cfg):
+    """
+    Return the account that should do the next unit of work.
+    With rotation off, everything runs on the listener account.
+    """
+    if not cfg.get("rotate_accounts", True):
+        return await pool.listener_account()
+    acc = await pool.next_worker()
+    return acc or await pool.listener_account()
+
+
+async def _listener_client():
+    acc = await pool.listener_account()
+    return acc.client if acc else None
+
+
+def _note_flood(acc, seconds: float):
+    if acc is not None:
+        acc.note_flood(seconds)
+
+
+# ── Restricted-content detection ──────────────────────────────────────────────
+
+def _is_restricted(message) -> bool:
+    """
+    True when Telegram forbids re-sending this message by reference — i.e. the
+    sending bot/channel has "Restrict saving content" (noforwards) enabled.
+    """
+    if getattr(message, "noforwards", False):
+        return True
+    chat = getattr(message, "chat", None)
+    if chat is not None and getattr(chat, "noforwards", False):
+        return True
+    return False
+
+
+async def _should_download(cfg, message) -> bool:
+    mode = (cfg.get("save_mode") or "auto").lower()
+    if mode == "download":
+        return True
+    if mode == "copy":
+        return False
+    return _is_restricted(message)   # auto
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
-async def process_post(messages, links, userbot, bot_app):
+async def process_post(messages, links, _unused_client=None, bot_app=None):
     """
     Process one source-channel post end-to-end.
-    `messages` is either a single Telethon Message or a list of Messages
-    (an album/media group — e.g. a post with more than one photo).
+    `messages` is a single Telethon Message or a list (album).
     `links` may be a single URL string or a list of URL strings.
     Queues behind _processing_lock so concurrent calls serialise.
     """
@@ -117,13 +155,14 @@ async def process_post(messages, links, userbot, bot_app):
 
     global _current_task
     primary_id = messages[0].id
+    delays = await get_delays()
 
     async with _processing_lock:
         if _is_cancelled():
             print(f"[processor] /stop active — skipping post {primary_id}")
             return
 
-        task = asyncio.ensure_future(_process_post_inner(messages, links, userbot, bot_app))
+        task = asyncio.ensure_future(_process_post_inner(messages, links))
         _current_task = task
         try:
             await task
@@ -134,12 +173,14 @@ async def process_post(messages, links, userbot, bot_app):
                 _current_task = None
 
         if not _is_cancelled():
-            await _sleep_cancellable(DELAY_BETWEEN_POSTS)
+            await _sleep_cancellable(delays["between_posts"])
 
 
-async def _process_post_inner(messages: list, links: list, userbot, bot_app):
+async def _process_post_inner(messages: list, links: list):
     message = messages[0]
     cfg = await get_config()
+    delays = await get_delays()
+
     db_channel          = cfg.get("db_channel")
     output_channel      = cfg.get("output_channel")
     second_bot_username = cfg.get("second_bot_username")
@@ -151,6 +192,10 @@ async def _process_post_inner(messages: list, links: list, userbot, bot_app):
 
     if not all([db_channel, output_channel, second_bot_username]):
         print(f"[processor] Missing config — skipping post {message.id}")
+        return
+
+    if not pool.live_accounts():
+        print("[processor] No logged-in userbot account — skipping post")
         return
 
     print(f"\n[processor] ══ Post {message.id} — {len(links)} link(s) ══")
@@ -167,80 +212,97 @@ async def _process_post_inner(messages: list, links: list, userbot, bot_app):
     except (ValueError, TypeError):
         out_ch = output_channel
 
-    # ── Process each link independently ──────────────────────────────────────
     link_replacements = []   # [(original_link, new_link), ...]
     all_db_msg_ids    = []
 
     for link_idx, original_link in enumerate(links):
         if _is_cancelled():
-            print(f"[processor] /stop — aborting mid-post")
+            print("[processor] /stop — aborting mid-post")
             return
 
         if link_idx > 0:
-            await _sleep_cancellable(DELAY_BETWEEN_LINKS)
+            await _sleep_cancellable(delays["between_links"])
             if _is_cancelled():
                 return
 
-        print(f"\n[processor] ── Link {link_idx + 1}/{len(links)}: {original_link}")
-
-        # Step A: get files from linked bot ───────────────────────────────────
-        files = await _get_files_from_link(original_link, userbot)
-        if not files:
-            print(f"[processor] No files for {original_link} — skipping this link")
-            await log_event("no_files", {"msg_id": message.id, "link": original_link})
-            await _send_log(userbot, log_channel,
-                            f"⚠️ *No files* for link `{original_link}` in post `{message.id}`")
-            continue
-
-        print(f"[processor] {len(files)} file(s) collected")
-
-        if _is_cancelled():
+        worker = await _pick_worker(cfg)
+        if worker is None or worker.client is None:
+            print("[processor] No available account — aborting post")
             return
 
-        # Step B: copy files to DB channel ────────────────────────────────────
-        db_msg_ids = []
-        for i, file_msg in enumerate(files):
+        print(f"\n[processor] ── Link {link_idx + 1}/{len(links)} on account "
+              f"{worker.index} ({worker.label}): {original_link}")
+
+        async with worker.lock:
+            client = worker.client
+
+            # Step A: get files from the linked bot ───────────────────────────
+            files = await _get_files_from_link(original_link, client, worker, delays)
+            if not files:
+                print(f"[processor] No files for {original_link} — skipping this link")
+                await log_event("no_files", {"msg_id": message.id, "link": original_link})
+                await _send_log(log_channel,
+                                f"⚠️ *No files* for link `{original_link}` in post `{message.id}`")
+                worker.touch()
+                continue
+
+            restricted = any(_is_restricted(f) for f in files)
+            mode_note = "restricted (download → upload)" if restricted else "normal (copy)"
+            print(f"[processor] {len(files)} file(s) collected — mode: {mode_note}")
+
             if _is_cancelled():
                 return
-            if i > 0:
-                await _sleep_cancellable(DELAY_BETWEEN_COPIES)
+
+            # Step B: store files in the DB channel ───────────────────────────
+            db_msg_ids = []
+            for i, file_msg in enumerate(files):
                 if _is_cancelled():
                     return
-            msg_id = await _copy_to_db(userbot, db_ch, file_msg, keep_caption)
-            if msg_id:
-                db_msg_ids.append(msg_id)
-                print(f"[processor] Copied file {i+1}/{len(files)} → DB msg {msg_id}")
+                if i > 0:
+                    await _sleep_cancellable(delays["between_copies"])
+                    if _is_cancelled():
+                        return
+                msg_id = await _store_in_db(client, worker, db_ch, file_msg,
+                                            keep_caption, cfg, delays)
+                if msg_id:
+                    db_msg_ids.append(msg_id)
+                    print(f"[processor] Stored file {i+1}/{len(files)} → DB msg {msg_id}")
 
-        if not db_msg_ids:
-            print(f"[processor] Nothing copied to DB for {original_link} — skipping")
-            await _send_log(userbot, log_channel,
-                            f"❌ *DB copy failed* for link `{original_link}` in post `{message.id}`")
-            continue
+            worker.touch()
 
-        if _is_cancelled():
-            return
+            if not db_msg_ids:
+                print(f"[processor] Nothing stored for {original_link} — skipping")
+                await _send_log(log_channel,
+                                f"❌ *DB save failed* for link `{original_link}` in post `{message.id}`")
+                continue
 
-        # Step C: build DB links ───────────────────────────────────────────────
-        db_links = [_make_msg_link(db_channel, mid) for mid in db_msg_ids]
-        print(f"[processor] DB links: {db_links}")
-        all_db_msg_ids.extend(db_msg_ids)
+            if _is_cancelled():
+                return
 
-        await _sleep_cancellable(DELAY_AFTER_COPY_BATCH)
-        if _is_cancelled():
-            return
+            # Step C: build DB links ──────────────────────────────────────────
+            db_links = [_make_msg_link(db_channel, mid) for mid in db_msg_ids]
+            print(f"[processor] DB links: {db_links}")
+            all_db_msg_ids.extend(db_msg_ids)
 
-        # Step D: generate new link ────────────────────────────────────────────
-        new_link = await _generate_link(second_bot_username, db_links, userbot)
+            await _sleep_cancellable(delays["after_copy_batch"])
+            if _is_cancelled():
+                return
+
+        # Step D: generate the new link (dedicated link account) ──────────────
+        new_link = await _generate_link(second_bot_username, db_links, delays)
         if not new_link:
             print(f"[processor] Second bot returned no link for {original_link} — skipping")
             await log_event("link_gen_failed", {"msg_id": message.id, "db_msg_ids": db_msg_ids})
-            await _send_log(userbot, log_channel,
+            await _send_log(log_channel,
                             f"❌ *Link generation failed* for post `{message.id}`\n"
                             f"DB msgs: `{db_msg_ids}`")
             continue
 
         print(f"[processor] New link: {new_link}")
         link_replacements.append((original_link, new_link))
+
+        # Give the account that just worked a short rest before it is reused
+        await _sleep_cancellable(min(delays["account_cooldown"], 1.0))
 
     if not link_replacements:
         print(f"[processor] No links processed — aborting post {message.id}")
@@ -265,20 +327,19 @@ async def _process_post_inner(messages: list, links: list, userbot, bot_app):
     final_html = _apply_template(processed_html, caption_template)
 
     first_new_link = link_replacements[0][1]
-    await _send_to_output(messages, final_html, first_new_link, out_ch, userbot)
+    await _send_to_output(messages, final_html, first_new_link, out_ch, cfg)
 
     # ── Log summary ───────────────────────────────────────────────────────────
     pairs_text = "\n".join(f"  • `{ol}` → {nl}" for ol, nl in link_replacements)
     await _send_log(
-        userbot, log_channel,
+        log_channel,
         f"✅ *Post processed*\n"
         f"• Source msg: `{message.id}`\n"
         f"• Links replaced: `{len(link_replacements)}`\n"
-        f"• Files copied: `{len(all_db_msg_ids)}`\n"
+        f"• Files saved: `{len(all_db_msg_ids)}`\n"
         f"{pairs_text}",
     )
 
-    # ── Persist mappings ──────────────────────────────────────────────────────
     for original_link, new_link in link_replacements:
         await save_file_mapping(message.id, original_link, all_db_msg_ids, new_link)
     await log_event("processed", {
@@ -292,11 +353,6 @@ async def _process_post_inner(messages: list, links: list, userbot, bot_app):
 # ── Text helpers ──────────────────────────────────────────────────────────────
 
 def _message_to_html(messages) -> str:
-    """
-    Build the HTML caption for a post. `messages` may be a single message or
-    a list (album) — for albums, only one message usually carries the
-    caption/entities, so scan all of them and use the first one with text.
-    """
     if isinstance(messages, TelethonMessage):
         messages = [messages]
     for message in messages:
@@ -314,7 +370,6 @@ def _message_to_html(messages) -> str:
 
 
 def _replace_link_in_html(html: str, original_link: str, new_link: str) -> str:
-    """Replace one original_link with new_link inside an HTML string."""
     _junk = re.compile(r"[*_~`'\".),!?\]>]+$")
     original_link = _junk.sub("", original_link)
 
@@ -350,11 +405,6 @@ def _apply_filter(html: str, keep_urls: list) -> str:
 
 
 def _apply_text_rules(html: str, rules: list) -> str:
-    """
-    Apply user-defined find/replace rules to the post text before sending.
-    Each rule is {"find": str, "replace": str}. An empty "replace" removes
-    the matched text entirely. Matching is plain substring (case-sensitive).
-    """
     for rule in rules:
         find = rule.get("find", "")
         replace = rule.get("replace", "")
@@ -372,30 +422,23 @@ def _apply_template(text: str, template: str) -> str:
         return text
     if "{text}" in template:
         return template.replace("{text}", text)
-    return f"{text}\n\n{template}" if text else template
+    return f"{text}\n\n{template}"
 
 
-# ── DB channel helpers ────────────────────────────────────────────────────────
-
-def _make_msg_link(db_channel: str, msg_id: int) -> str:
-    ch = str(db_channel).strip()
+def _make_msg_link(channel, msg_id: int) -> str:
+    ch = str(channel)
+    if ch.startswith("@"):
+        return f"https://t.me/{ch.lstrip('@')}/{msg_id}"
     if ch.startswith("-100"):
-        bare = ch[4:]
-        return f"https://t.me/c/{bare}/{msg_id}"
-    elif ch.startswith("-"):
-        bare = ch[1:]
-        return f"https://t.me/c/{bare}/{msg_id}"
-    else:
-        username = ch.lstrip("@")
-        return f"https://t.me/{username}/{msg_id}"
+        return f"https://t.me/c/{ch[4:]}/{msg_id}"
+    if ch.lstrip("-").isdigit():
+        return f"https://t.me/c/{ch.lstrip('-')}/{msg_id}"
+    return f"https://t.me/{ch}/{msg_id}"
 
+
+# ── Media helpers ─────────────────────────────────────────────────────────────
 
 def _is_supported_media(media) -> bool:
-    """
-    True for anything worth storing in the DB channel: photos, videos,
-    audio, and documents of any kind (mkv/mp4/zip/pdf…).
-    Only link previews and stickers are skipped.
-    """
     if media is None:
         return False
     if isinstance(media, MessageMediaWebPage):
@@ -403,54 +446,54 @@ def _is_supported_media(media) -> bool:
     if isinstance(media, MessageMediaPhoto):
         return True
     if isinstance(media, MessageMediaDocument):
-        attrs = getattr(getattr(media, "document", None), "attributes", []) or []
+        doc = getattr(media, "document", None)
+        attrs = getattr(doc, "attributes", []) or []
         if any(isinstance(a, DocumentAttributeSticker) for a in attrs):
             return False
         return True
     return False
 
 
-def _media_filename(file_msg) -> str | None:
-    doc = getattr(getattr(file_msg, "media", None), "document", None)
-    for attr in getattr(doc, "attributes", []) or []:
+def _media_filename(msg) -> str | None:
+    media = getattr(msg, "media", None)
+    doc = getattr(media, "document", None)
+    for attr in (getattr(doc, "attributes", []) or []):
         if isinstance(attr, DocumentAttributeFilename):
             return attr.file_name
     return None
 
 
-async def _resolve_target(userbot, chat):
-    """
-    Resolve a channel id/@username into an entity Telethon can send to.
-    A bare -100… id fails with "Cannot find any entity" unless it is cached,
-    so fall back to the dialog-walking resolver in userbot.client.
-    """
+async def _resolve_target(client, chat):
     try:
-        return await userbot.get_entity(chat)
+        return await client.get_entity(chat)
     except Exception:
         pass
     try:
         import userbot.client as _ub
-        return await _ub._resolve_entity(str(chat))
+        return await _ub._resolve_entity(str(chat), client)
     except Exception as e:
         print(f"[processor] Could not resolve channel {chat}: {e}")
         return None
 
 
-async def _copy_to_db(userbot, db_ch, file_msg, keep_caption: bool = True) -> int | None:
+async def _store_in_db(client, worker, db_ch, file_msg, keep_caption, cfg, delays) -> int | None:
     """
-    Copy one file (photo, video, audio or document) to the DB channel.
-    Tries to re-send by reference first; if the sending bot protects its
-    content, downloads the file and re-uploads it instead.
-    Retries up to 3 times on FloodWaitError.
+    Put one file into the DB channel.
+
+    Normal mode re-sends the file by reference (no upload traffic).
+    Restricted mode — forced with /setmode download, or detected automatically
+    when the source bot has saving/forwarding disabled — downloads the file to
+    a temp file and uploads it again, which works for protected content.
+    Retries up to 3 times on FloodWait.
     """
     if not _is_supported_media(file_msg.media):
         kind = type(file_msg.media).__name__ if file_msg.media else "text"
         print(f"[processor] Skipping unsupported media: {kind}")
         return None
 
-    target = await _resolve_target(userbot, db_ch)
+    target = await _resolve_target(client, db_ch)
     if target is None:
-        print(f"[processor] DB channel {db_ch} unreachable — is the userbot a member/admin?")
+        print(f"[processor] DB channel {db_ch} unreachable — is this account a member/admin?")
         return None
 
     if keep_caption:
@@ -462,11 +505,15 @@ async def _copy_to_db(userbot, db_ch, file_msg, keep_caption: bool = True) -> in
     else:
         text = ""
 
+    if await _should_download(cfg, file_msg):
+        print("[processor] Restricted/forced mode — downloading then re-uploading")
+        return await _upload_via_download(client, worker, target, file_msg, text, delays)
+
     for attempt in range(3):
         if _is_cancelled():
             return None
         try:
-            sent = await userbot.send_file(
+            sent = await client.send_file(
                 target,
                 file=file_msg.media,
                 caption=text or None,
@@ -475,59 +522,80 @@ async def _copy_to_db(userbot, db_ch, file_msg, keep_caption: bool = True) -> in
             return sent.id
         except FloodWaitError as e:
             wait = e.seconds + 5
+            _note_flood(worker, wait)
             print(f"[processor] FloodWait on DB copy — waiting {wait}s (attempt {attempt + 1}/3)")
             await _sleep_cancellable(wait)
             if _is_cancelled():
                 return None
         except Exception as e:
-            print(f"[processor] DB copy by reference failed (attempt {attempt + 1}/3): {e}")
-            msg_id = await _copy_to_db_via_download(userbot, target, file_msg, text)
+            print(f"[processor] Copy by reference failed (attempt {attempt + 1}/3): {e}")
+            msg_id = await _upload_via_download(client, worker, target, file_msg, text, delays)
             if msg_id:
                 return msg_id
             if attempt < 2:
-                await _sleep_cancellable(10)
+                await _sleep_cancellable(max(delays["between_copies"], 5))
             else:
                 return None
     return None
 
 
-async def _copy_to_db_via_download(userbot, target, file_msg, caption: str) -> int | None:
+async def _upload_via_download(client, worker, target, file_msg, caption: str, delays) -> int | None:
     """
-    Fallback used when a file cannot be re-sent by reference (for example when
-    the source bot enables content protection): download it, then upload it.
+    Save-restricted path: download the media to a temporary file and upload it
+    to the DB channel. Streaming through a file (not memory) keeps large videos
+    safe on small hosts.
     """
+    tmp_dir = tempfile.mkdtemp(prefix="tgdl_")
+    path = None
     try:
-        print("[processor] Falling back to download + re-upload…")
-        data = await userbot.download_media(file_msg, file=bytes)
-        if not data:
-            print("[processor] Download returned nothing")
+        print("[processor] Downloading media…")
+        path = await client.download_media(file_msg, file=tmp_dir)
+        if not path or not os.path.exists(path):
+            print("[processor] Download produced no file")
             return None
-        name = _media_filename(file_msg) or f"file_{file_msg.id}"
-        from io import BytesIO
-        buf = BytesIO(data)
-        buf.name = name
-        sent = await userbot.send_file(
+
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"[processor] Downloaded {os.path.basename(path)} ({size_mb:.1f} MB) — uploading")
+
+        # Short breather between the download and the upload so the account
+        # doesn't do two heavy operations back to back.
+        await _sleep_cancellable(min(delays["conversation_step"], 2.0))
+        if _is_cancelled():
+            return None
+
+        force_doc = bool(_media_filename(file_msg))
+        sent = await client.send_file(
             target,
-            file=buf,
+            file=path,
             caption=caption or None,
             parse_mode="html",
-            force_document=bool(_media_filename(file_msg)),
+            force_document=force_doc,
+            supports_streaming=not force_doc,
         )
-        print(f"[processor] Re-uploaded '{name}' → DB msg {sent.id}")
+        print(f"[processor] Uploaded → DB msg {sent.id}")
         return sent.id
     except FloodWaitError as e:
-        print(f"[processor] FloodWait during re-upload — waiting {e.seconds + 5}s")
-        await _sleep_cancellable(e.seconds + 5)
+        wait = e.seconds + 5
+        _note_flood(worker, wait)
+        print(f"[processor] FloodWait during re-upload — waiting {wait}s")
+        await _sleep_cancellable(wait)
         return None
     except Exception as e:
         print(f"[processor] Download + re-upload failed: {e}")
         return None
+    finally:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+            os.rmdir(tmp_dir)
+        except Exception:
+            pass
 
 
 # ── File collection ───────────────────────────────────────────────────────────
 
-async def _get_files_from_link(link: str, userbot) -> list:
-    """Open a bot deep link as userbot and collect all file messages."""
+async def _get_files_from_link(link: str, client, worker, delays, _retry: bool = False) -> list:
+    """Open a bot deep link with one account and collect all file messages."""
     m = TG_DEEP_LINK_RE.match(link)
     if m:
         bot_username = m.group(1)
@@ -543,7 +611,7 @@ async def _get_files_from_link(link: str, userbot) -> list:
     print(f"[processor] Opening @{bot_username} start='{start_param}'")
     files = []
     try:
-        async with userbot.conversation(bot_username, timeout=60) as conv:
+        async with client.conversation(bot_username, timeout=60) as conv:
             cmd = f"/start {start_param}" if start_param else "/start"
             await conv.send_message(cmd)
             print(f"[processor]   → sent: {cmd}")
@@ -560,14 +628,15 @@ async def _get_files_from_link(link: str, userbot) -> list:
                     if has_media:
                         files.append(resp)
                 except asyncio.TimeoutError:
-                    print(f"[processor]   → silence — bot finished")
+                    print("[processor]   → silence — bot finished")
                     break
     except FloodWaitError as e:
         wait = e.seconds + 5
-        print(f"[processor] FloodWait on conversation — waiting {wait}s then retrying once")
+        _note_flood(worker, wait)
+        print(f"[processor] FloodWait on conversation — waiting {wait}s")
         await _sleep_cancellable(wait)
-        if not _is_cancelled():
-            return await _get_files_from_link(link, userbot)
+        if not _is_cancelled() and not _retry:
+            return await _get_files_from_link(link, client, worker, delays, _retry=True)
     except Exception as e:
         print(f"[processor] Conversation with @{bot_username} failed: {e}")
 
@@ -575,36 +644,44 @@ async def _get_files_from_link(link: str, userbot) -> list:
     return files
 
 
-# ── Link generation ───────────────────────────────────────────────────────────
+# ── Link generation (runs on the pinned link account) ─────────────────────────
 
-async def _generate_link(bot_username: str, db_links: list, userbot) -> str | None:
+async def _generate_link(bot_username: str, db_links: list, delays) -> str | None:
     if not db_links:
         return None
+    acc = await pool.link_account()
+    if acc is None or acc.client is None:
+        print("[processor] No account available for link generation")
+        return None
+
     bot = bot_username.lstrip("@")
-    if len(db_links) == 1:
-        return await _genlink_single(bot, db_links[0], userbot)
-    return await _batch_conversational(bot, db_links, userbot)
+    async with acc.lock:
+        if len(db_links) == 1:
+            return await _genlink_single(bot, db_links[0], acc, delays)
+        return await _batch_conversational(bot, db_links, acc, delays)
 
 
-async def _genlink_single(bot: str, link: str, userbot) -> str | None:
-    print(f"[processor] → @{bot}: /genlink")
+async def _genlink_single(bot: str, link: str, acc, delays) -> str | None:
+    step = delays["conversation_step"]
+    print(f"[processor] → @{bot}: /genlink (account {acc.index})")
+    client = acc.client
     try:
-        async with userbot.conversation(bot, timeout=60) as conv:
+        async with client.conversation(bot, timeout=60) as conv:
             await conv.send_message("/genlink")
-            await _sleep_cancellable(DELAY_CONVERSATION_STEP)
+            await _sleep_cancellable(step)
             if _is_cancelled():
                 return None
 
             resp1 = await asyncio.wait_for(conv.get_response(), timeout=20)
             print(f"[processor]   ← {repr(_msg_text(resp1)[:100])}")
 
-            await _sleep_cancellable(DELAY_CONVERSATION_STEP)
+            await _sleep_cancellable(step)
             if _is_cancelled():
                 return None
 
             await conv.send_message(link)
 
-            await _sleep_cancellable(DELAY_CONVERSATION_STEP)
+            await _sleep_cancellable(step)
             if _is_cancelled():
                 return None
 
@@ -624,6 +701,7 @@ async def _genlink_single(bot: str, link: str, userbot) -> str | None:
 
     except FloodWaitError as e:
         wait = e.seconds + 5
+        _note_flood(acc, wait)
         print(f"[processor] FloodWait on /genlink — waiting {wait}s")
         await _sleep_cancellable(wait)
     except Exception as e:
@@ -631,39 +709,41 @@ async def _genlink_single(bot: str, link: str, userbot) -> str | None:
     return None
 
 
-async def _batch_conversational(bot: str, db_links: list, userbot) -> str | None:
+async def _batch_conversational(bot: str, db_links: list, acc, delays) -> str | None:
+    step = delays["conversation_step"]
     first_link = db_links[0]
     last_link  = db_links[-1]
+    client = acc.client
 
     print(f"[processor] → @{bot}: /batch  first={first_link}  last={last_link}")
     try:
-        async with userbot.conversation(bot, timeout=90) as conv:
+        async with client.conversation(bot, timeout=90) as conv:
             await conv.send_message("/batch")
-            await _sleep_cancellable(DELAY_CONVERSATION_STEP)
+            await _sleep_cancellable(step)
             if _is_cancelled():
                 return None
 
             resp1 = await asyncio.wait_for(conv.get_response(), timeout=20)
             print(f"[processor]   ← {repr(_msg_text(resp1)[:100])}")
 
-            await _sleep_cancellable(DELAY_CONVERSATION_STEP)
+            await _sleep_cancellable(step)
             if _is_cancelled():
                 return None
             await conv.send_message(first_link)
 
-            await _sleep_cancellable(DELAY_CONVERSATION_STEP)
+            await _sleep_cancellable(step)
             if _is_cancelled():
                 return None
 
             resp2 = await asyncio.wait_for(conv.get_response(), timeout=20)
             print(f"[processor]   ← {repr(_msg_text(resp2)[:100])}")
 
-            await _sleep_cancellable(DELAY_CONVERSATION_STEP)
+            await _sleep_cancellable(step)
             if _is_cancelled():
                 return None
             await conv.send_message(last_link)
 
-            await _sleep_cancellable(DELAY_CONVERSATION_STEP)
+            await _sleep_cancellable(step)
             if _is_cancelled():
                 return None
 
@@ -682,9 +762,10 @@ async def _batch_conversational(bot: str, db_links: list, userbot) -> str | None
                 pass
 
     except asyncio.TimeoutError:
-        print(f"[processor] /batch timed out")
+        print("[processor] /batch timed out")
     except FloodWaitError as e:
         wait = e.seconds + 5
+        _note_flood(acc, wait)
         print(f"[processor] FloodWait on /batch — waiting {wait}s")
         await _sleep_cancellable(wait)
     except Exception as e:
@@ -719,70 +800,128 @@ def _extract_url_from_response(resp) -> str | None:
     return None
 
 
-async def _send_to_output(original_msgs, html_text: str, new_link: str, output_channel, userbot):
+async def _download_originals(client, messages: list) -> tuple[list, str | None]:
+    """Download the source post's media so it can be re-uploaded (restricted source)."""
+    tmp_dir = tempfile.mkdtemp(prefix="tgout_")
+    paths = []
+    for m in messages:
+        if not m.media:
+            continue
+        try:
+            p = await client.download_media(m, file=tmp_dir)
+            if p:
+                paths.append(p)
+        except Exception as e:
+            print(f"[processor] Could not download source media: {e}")
+    return paths, tmp_dir
+
+
+def _cleanup(paths: list, tmp_dir: str | None):
+    for p in paths:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+    try:
+        if tmp_dir:
+            os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+
+async def _send_to_output(original_msgs, html_text: str, new_link: str, output_channel, cfg):
     """
-    Send the processed post to the output channel.
-    `original_msgs` may be a single Telethon Message or a list (album).
-    When the source post has more than one photo/video, ALL of them are
-    sent together to the output channel as an album — not just one.
-    Retries up to 3 times on FloodWait.
-    Never falls back to a text-only message when the original had media —
-    that would produce a broken/distorted post.
+    Send the processed post to the output channel using the listener account.
+    When the source channel blocks saving/forwarding (or /setmode download is
+    on), the media is downloaded and uploaded again instead of re-sent by
+    reference. Retries up to 3 times on FloodWait.
     """
     if isinstance(original_msgs, TelethonMessage):
         original_msgs = [original_msgs]
 
+    acc = await pool.listener_account()
+    if acc is None or acc.client is None:
+        print("[processor] No account available to post output")
+        return
+    client = acc.client
+
     primary_id = original_msgs[0].id
-    media_list = [m.media for m in original_msgs if m.media]
-    has_media = bool(media_list)
+    media_msgs = [m for m in original_msgs if m.media]
+    has_media = bool(media_msgs)
 
-    print(f"[processor] Sending to output channel {output_channel} ({len(media_list)} media item(s))")
+    print(f"[processor] Sending to output channel {output_channel} ({len(media_msgs)} media item(s))")
 
-    target = await _resolve_target(userbot, output_channel)
+    target = await _resolve_target(client, output_channel)
     if target is None:
         print(f"[processor] Output channel {output_channel} unreachable — post {primary_id} skipped")
         return
 
-    for attempt in range(3):
-        if _is_cancelled():
-            return
-        try:
-            if has_media:
-                await userbot.send_file(
-                    target,
-                    file=media_list if len(media_list) > 1 else media_list[0],
-                    caption=html_text or None,
-                    parse_mode="html",
-                )
-            else:
-                await userbot.send_message(
-                    target,
-                    html_text,
-                    parse_mode="html",
-                    link_preview=True,
-                )
-            print("[processor] Sent to output channel")
-            return
-        except FloodWaitError as e:
-            wait = e.seconds + 5
-            print(f"[processor] FloodWait on output send — waiting {wait}s (attempt {attempt + 1}/3)")
-            await _sleep_cancellable(wait)
-        except Exception as e:
-            print(f"[processor] Output send failed (attempt {attempt + 1}/3): {e}")
-            if attempt < 2:
-                await _sleep_cancellable(15)
-            else:
-                print(f"[processor] All output attempts failed — post {primary_id} skipped")
+    need_download = has_media and await _should_download(cfg, original_msgs[0])
+    paths, tmp_dir = ([], None)
+    if need_download:
+        print("[processor] Source is save-restricted — downloading media for re-upload")
+        paths, tmp_dir = await _download_originals(client, media_msgs)
+        if not paths:
+            need_download = False
+
+    try:
+        for attempt in range(3):
+            if _is_cancelled():
+                return
+            try:
+                if need_download and paths:
+                    await client.send_file(
+                        target,
+                        file=paths if len(paths) > 1 else paths[0],
+                        caption=html_text or None,
+                        parse_mode="html",
+                    )
+                elif has_media:
+                    media_list = [m.media for m in media_msgs]
+                    await client.send_file(
+                        target,
+                        file=media_list if len(media_list) > 1 else media_list[0],
+                        caption=html_text or None,
+                        parse_mode="html",
+                    )
+                else:
+                    await client.send_message(
+                        target,
+                        html_text,
+                        parse_mode="html",
+                        link_preview=False,
+                    )
+                print(f"[processor] Post {primary_id} sent to output channel")
+                return
+            except FloodWaitError as e:
+                wait = e.seconds + 5
+                _note_flood(acc, wait)
+                print(f"[processor] FloodWait on output — waiting {wait}s (attempt {attempt+1}/3)")
+                await _sleep_cancellable(wait)
+            except Exception as e:
+                print(f"[processor] Output send failed (attempt {attempt+1}/3): {e}")
+                if has_media and not need_download and not paths:
+                    # Reference send rejected — fall back to download + upload.
+                    print("[processor] Falling back to download + re-upload for output")
+                    paths, tmp_dir = await _download_originals(client, media_msgs)
+                    need_download = bool(paths)
+                await _sleep_cancellable(5)
+        print(f"[processor] Giving up on post {primary_id} after 3 attempts")
+    finally:
+        _cleanup(paths, tmp_dir)
 
 
-async def _send_log(userbot, log_channel, text: str):
+async def _send_log(log_channel, text: str):
+    """Send a status line to the log channel (listener account)."""
     if not log_channel:
         return
     try:
-        lc = int(log_channel)
-    except (ValueError, TypeError):
-        lc = log_channel
-    try:
-        await userbot.send_message(lc, text, parse_mode="md")
+        client = await _listener_client()
+        if client is None:
+            return
+        target = await _resolve_target(client, log_channel)
+        if target is None:
+            return
+        await client.send_message(target, text, parse_mode="md", link_preview=False)
     except Exception as e:
-        print(f"[processor] Log channel send failed: {e}")
+        print(f"[processor] Could not write to log channel: {e}")

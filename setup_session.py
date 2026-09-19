@@ -1,47 +1,33 @@
 """
-Run this ONCE locally to generate a SESSION_STRING for Render deployment.
+Optional one-time helper: generate a StringSession for the FIRST userbot
+account without using the admin bot.
 
-Usage:
-    pip install telethon python-dotenv
+Normally you don't need this — just send /login to your admin bot (as many
+times as you have accounts). Use this script only if you prefer to seed the
+first account through the SESSION_STRING environment variable.
+
     python setup_session.py
-
-Then copy the SESSION_STRING value into Render > Environment Variables.
 """
 import asyncio
-import sys
-import os
-sys.path.insert(0, os.path.dirname(__file__))
-
-from dotenv import load_dotenv
-load_dotenv()
-
-API_ID   = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
+from config import API_ID, API_HASH
 
-async def main():
-    print("=== Userbot Session Setup ===")
-    print("Logs in as YOUR Telegram account (not a bot).")
-    print("You will receive an OTP on Telegram.\n")
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
-    await client.start()
-
-    me = await client.get_me()
-    session_str = client.session.save()
-
-    print(f"\nLogged in as: {me.first_name} (@{me.username}) — ID: {me.id}")
-    print("\n" + "=" * 60)
-    print("SESSION_STRING (copy this into Render Environment Variables):")
-    print("=" * 60)
-    print(session_str)
-    print("=" * 60)
-    print("\nSet this as SESSION_STRING in Render > Environment.")
-
-    await client.disconnect()
+async def main() -> None:
+    print("Logging in a Telegram user account…")
+    async with TelegramClient(StringSession(), API_ID, API_HASH) as client:
+        me = await client.get_me()
+        print()
+        print(f"Logged in as: {me.first_name} (@{me.username})")
+        print()
+        print("Copy the line below into SESSION_STRING in your environment:")
+        print()
+        print(client.session.save())
+        print()
+        print("Extra accounts are added later with /login in the admin bot.")
 
 
 if __name__ == "__main__":

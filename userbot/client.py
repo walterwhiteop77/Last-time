@@ -1,26 +1,60 @@
+"""
+Userbot layer — now backed by the multi-account pool in `userbot/pool.py`.
+
+The *listener* account watches the source channel. Every heavy job (opening
+bot links, downloading, uploading) is handed to a rotating worker account so
+no single number carries all the traffic.
+"""
+
 import asyncio
 import re
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
+
+from telethon import events
 from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
+from telethon.tl.functions.channels import JoinChannelRequest
 
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from config import API_ID, API_HASH, SESSION_NAME, SESSION_STRING
 from database import get_config, log_event
+import userbot.pool as pool
 
-userbot: TelegramClient = None
 _forward_callback = None
 
-# Fired once login completes so main.py can start listening
-login_done = asyncio.Event()
+# Fired once at least one account is logged in
+login_done = pool.login_done
 
 # Set to True to cancel any running scan / fbatch
 _scan_cancelled: bool = False
 
+
+# ── Compatibility shim ────────────────────────────────────────────────────────
+# Older code (and several admin commands) referenced the module-level
+# `userbot` client. It now resolves to the listener account's client.
+
+def _client():
+    c = pool.listener_client()
+    if c is None:
+        raise RuntimeError("No userbot account is logged in. Use /login first.")
+    return c
+
+
+class _ListenerProxy:
+    """Attribute proxy so `ub.userbot.<anything>` keeps working."""
+
+    def __getattr__(self, name):
+        return getattr(_client(), name)
+
+    def __bool__(self):
+        return pool.listener_client() is not None
+
+
+userbot = _ListenerProxy()
+
+
+# ── Cancellation ──────────────────────────────────────────────────────────────
 
 def cancel_scan():
     global _scan_cancelled
@@ -42,102 +76,62 @@ def set_forward_callback(fn):
     _forward_callback = fn
 
 
+# ── Pool lifecycle ────────────────────────────────────────────────────────────
+
 async def init_client():
-    """
-    Create the TelegramClient.
-    Priority order for session:
-      1. SESSION_STRING env var  (set explicitly by operator)
-      2. session_string stored in MongoDB  (saved automatically after /login)
-      3. Local .session file  (fallback for local dev)
-    This ensures the userbot stays logged in across server restarts.
-    """
-    global userbot
-    session = None
-
-    if SESSION_STRING:
-        print("[userbot] Using SESSION_STRING env var (StringSession)")
-        session = StringSession(SESSION_STRING)
-    else:
-        try:
-            from database import get_session_string
-            stored = await get_session_string()
-            if stored:
-                session = StringSession(stored)
-                print("[userbot] Loaded session string from MongoDB — no re-login needed")
-            else:
-                print("[userbot] No stored session — using file session:", SESSION_NAME)
-                session = SESSION_NAME
-        except Exception as e:
-            print(f"[userbot] Could not read session from MongoDB ({e}) — using file session")
-            session = SESSION_NAME
-
-    userbot = TelegramClient(session, API_ID, API_HASH)
-
-
-async def _save_session_to_db():
-    """
-    Export the current in-memory session as a string and store it in MongoDB.
-    Called automatically after every successful /login so restarts don't need re-auth.
-    """
-    try:
-        from database import save_session_string
-        session_str = StringSession.save(userbot.session)
-        await save_session_string(session_str)
-        print("[userbot] Session string saved to MongoDB — future restarts will not require re-login")
-    except Exception as e:
-        print(f"[userbot] Could not save session to MongoDB: {e}")
+    """Connect every stored account (migrating any legacy single session)."""
+    return await pool.load_pool()
 
 
 async def connect():
-    """Connect to Telegram without authenticating."""
-    if userbot is None:
-        raise RuntimeError("init_client() must be called before connect()")
-    await userbot.connect()
+    """Kept for backwards compatibility — load_pool() already connects."""
+    return None
 
 
 async def is_authorized() -> bool:
-    if userbot is None:
-        return False
-    try:
-        return await userbot.is_user_authorized()
-    except Exception as e:
-        print(f"[userbot] is_authorized check failed: {e}")
-        return False
+    for acc in pool.live_accounts():
+        try:
+            if await acc.client.is_user_authorized():
+                return True
+        except Exception:
+            continue
+    return False
 
+
+# ── Login (delegates to the pool) ─────────────────────────────────────────────
 
 async def send_code(phone: str) -> str:
-    """Send OTP to the given phone number. Returns phone_code_hash."""
-    result = await userbot.send_code_request(phone)
-    return result.phone_code_hash
+    await pool.begin_login(phone)
+    return pool.pending_hash
 
 
 async def sign_in(phone: str, code: str, phone_code_hash: str):
-    """
-    Sign in with OTP. Raises SessionPasswordNeededError if 2FA is enabled.
-    Returns the signed-in User object on success.
-    """
-    return await userbot.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+    return await pool.complete_login_code(code)
 
 
 async def sign_in_2fa(password: str):
-    """Sign in with 2FA password."""
-    return await userbot.sign_in(password=password)
+    return await pool.complete_login_2fa(password)
 
 
-async def join_source_channel(source: str):
-    """Join / subscribe to the source channel so Telegram sends updates for it."""
+# ── Channel access ────────────────────────────────────────────────────────────
+
+async def join_source_channel(source: str, client=None):
+    """Join / subscribe to a channel with one account (default: listener)."""
+    client = client or _client()
     try:
-        await userbot.get_dialogs()
-        entity = await userbot.get_entity(source)
-        from telethon.tl.functions.channels import JoinChannelRequest
-        await userbot(JoinChannelRequest(entity))
-        print(f"[userbot] Joined/subscribed to source channel: {source}")
+        await client.get_dialogs()
+        entity = await client.get_entity(str(source))
+        await client(JoinChannelRequest(entity))
+        print(f"[userbot] Joined/subscribed to channel: {source}")
     except Exception as e:
-        print(f"[userbot] Note: could not join source channel ({e}) — may already be a member")
+        print(f"[userbot] Note: could not join {source} ({e}) — may already be a member")
+
+
+async def join_all_accounts(targets: list):
+    return await pool.join_everywhere([t for t in targets if t])
 
 
 async def _match_source_chat(event, cfg) -> bool:
-    """Return True if this event's chat matches the configured source channel."""
     source = cfg.get("source_channel")
     if not source:
         return False
@@ -164,13 +158,16 @@ async def _match_source_chat(event, cfg) -> bool:
 
 
 async def begin_listening():
-    """Register event handlers and run until disconnected."""
+    """Register event handlers on the listener account and run forever."""
+    acc = await pool.listener_account()
+    if acc is None or acc.client is None:
+        raise RuntimeError("No listener account available.")
 
-    @userbot.on(events.NewMessage())
+    client = acc.client
+    print(f"[userbot] Listener account: {acc.index}. {acc.label}")
+
+    @client.on(events.NewMessage())
     async def on_new_message(event):
-        # Messages that belong to an album (grouped_id set) are handled
-        # together by the Album handler below, so all photos get sent —
-        # skip them here to avoid processing the same post twice.
         if event.message.grouped_id:
             return
 
@@ -180,7 +177,6 @@ async def begin_listening():
         if not await _match_source_chat(event, cfg):
             return
 
-        # A previous /stop only cancels scans — live posts resume from here.
         if _scan_cancelled:
             reset_scan_cancel()
 
@@ -197,7 +193,7 @@ async def begin_listening():
         if _forward_callback:
             asyncio.create_task(_forward_callback(event.message, links))
 
-    @userbot.on(events.Album())
+    @client.on(events.Album())
     async def on_new_album(event):
         cfg = await get_config()
         if not cfg.get("active"):
@@ -209,7 +205,7 @@ async def begin_listening():
             reset_scan_cancel()
 
         messages = event.messages
-        print(f"[userbot] New album in source channel — {len(messages)} photo(s), first msg_id={messages[0].id}")
+        print(f"[userbot] New album — {len(messages)} item(s), first msg_id={messages[0].id}")
         await log_event("new_post", {
             "msg_id": messages[0].id,
             "chat_id": event.chat_id,
@@ -233,10 +229,18 @@ async def begin_listening():
             asyncio.create_task(_forward_callback(messages, links))
 
     print("[userbot] Authorized and listening for new posts.")
-    await userbot.run_until_disconnected()
+    await client.run_until_disconnected()
 
 
-async def _resolve_entity(source: str):
+async def restart_listening():
+    """Used after /setlistener — reconnect handlers on the new listener."""
+    asyncio.create_task(begin_listening())
+
+
+# ── Entity resolution ─────────────────────────────────────────────────────────
+
+async def _resolve_entity(source: str, client=None):
+    client = client or _client()
     source = str(source).strip()
 
     bare_id = None
@@ -252,12 +256,12 @@ async def _resolve_entity(source: str):
         pass
 
     try:
-        return await userbot.get_entity(source)
+        return await client.get_entity(source)
     except Exception:
         pass
 
     print(f"[userbot] resolving: walking all dialogs to find {source}…")
-    async for dialog in userbot.iter_dialogs():
+    async for dialog in client.iter_dialogs():
         entity = dialog.entity
         eid = getattr(entity, "id", None)
         if eid is None:
@@ -274,21 +278,15 @@ async def _resolve_entity(source: str):
 
     try:
         print(f"[userbot] trying to join {source}…")
-        await join_source_channel(source)
-        return await userbot.get_entity(source)
+        await join_source_channel(source, client)
+        return await client.get_entity(source)
     except Exception as e:
         raise ValueError(
-            f"Cannot resolve '{source}'. Make sure the userbot is a member. Error: {e}"
+            f"Cannot resolve '{source}'. Make sure the account is a member. Error: {e}"
         )
 
 
 def _group_by_album(messages: list) -> list:
-    """
-    Group a chronologically-ordered list of messages so that consecutive
-    messages sharing the same non-null grouped_id (i.e. an album/media
-    group with multiple photos) end up together. Returns a list of groups,
-    where each group is itself a list of one or more messages.
-    """
     groups = []
     current = []
     current_gid = None
@@ -307,8 +305,6 @@ def _group_by_album(messages: list) -> list:
 
 
 def _links_for_group(group: list) -> list:
-    """Return links found on ANY message in the group (albums usually carry
-    the caption/links on just one message of the group)."""
     for m in group:
         found = _extract_links(m)
         if found:
@@ -316,15 +312,18 @@ def _links_for_group(group: list) -> list:
     return []
 
 
+# ── Scanning ──────────────────────────────────────────────────────────────────
+
 async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0) -> int:
+    """Scan the source channel (oldest → newest) and process posts with links."""
+    client = _client()
     try:
-        entity = await _resolve_entity(source)
+        entity = await _resolve_entity(source, client)
     except Exception as e:
         print(f"[userbot] scan: {e}")
         return 0
 
     fetch_limit = limit if limit > 0 else None
-
     kwargs = dict(limit=fetch_limit)
     if min_id > 0:
         kwargs["min_id"] = min_id
@@ -333,7 +332,7 @@ async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0) -
         print(f"[userbot] scan: fetching last {limit} messages")
 
     all_messages = []
-    async for message in userbot.iter_messages(entity, **kwargs):
+    async for message in client.iter_messages(entity, **kwargs):
         all_messages.append(message)
     all_messages.reverse()
 
@@ -352,24 +351,28 @@ async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0) -
         if _scan_cancelled:
             print(f"[userbot] scan: cancelled by /stop after {processed} posts")
             break
-        print(f"[userbot] scan: msg {group[0].id} ({len(group)} photo(s)) → {links}")
         if callback:
             await callback(group, links)
         processed += 1
-
     return processed
 
 
+# Backwards-compatible alias
+async def scan_recent(source: str, limit: int, callback, after_id: int = 0) -> int:
+    return await scan_channel(source, callback, min_id=after_id, limit=limit)
+
+
 async def scan_range(source: str, start_id: int, end_id: int, callback) -> int:
+    client = _client()
     try:
-        entity = await _resolve_entity(source)
+        entity = await _resolve_entity(source, client)
     except Exception as e:
         print(f"[userbot] scan_range: {e}")
         return 0
 
     print(f"[userbot] scan_range: fetching messages {start_id}–{end_id}")
     all_messages = []
-    async for message in userbot.iter_messages(entity, min_id=start_id - 1, max_id=end_id):
+    async for message in client.iter_messages(entity, min_id=start_id - 1, max_id=end_id):
         all_messages.append(message)
     all_messages.reverse()
 
@@ -388,7 +391,7 @@ async def scan_range(source: str, start_id: int, end_id: int, callback) -> int:
         if _scan_cancelled:
             print(f"[userbot] scan_range: cancelled by /stop after {processed} posts")
             break
-        print(f"[userbot] scan_range: msg {group[0].id} ({len(group)} photo(s)) → {links}")
+        print(f"[userbot] scan_range: msg {group[0].id} ({len(group)} item(s)) → {links}")
         if callback:
             await callback(group, links)
         processed += 1
@@ -398,8 +401,9 @@ async def scan_range(source: str, start_id: int, end_id: int, callback) -> int:
 
 async def process_single(source: str, msg_id: int, callback) -> bool:
     try:
-        entity = await _resolve_entity(source)
-        messages = await userbot.get_messages(entity, ids=[msg_id])
+        client = _client()
+        entity = await _resolve_entity(source, client)
+        messages = await client.get_messages(entity, ids=[msg_id])
         if not messages or not messages[0]:
             return False
         message = messages[0]
@@ -407,8 +411,7 @@ async def process_single(source: str, msg_id: int, callback) -> bool:
         group = [message]
         grouped_id = getattr(message, "grouped_id", None)
         if grouped_id is not None:
-            # Fetch a small window around the message to pick up its album siblings.
-            window = await userbot.get_messages(entity, limit=40, min_id=msg_id - 10, max_id=msg_id + 10)
+            window = await client.get_messages(entity, limit=40, min_id=msg_id - 10, max_id=msg_id + 10)
             siblings = [m for m in window if getattr(m, "grouped_id", None) == grouped_id]
             if siblings:
                 siblings.sort(key=lambda m: m.id)
@@ -425,6 +428,8 @@ async def process_single(source: str, msg_id: int, callback) -> bool:
         return False
 
 
+# ── Link extraction ───────────────────────────────────────────────────────────
+
 TG_LINK_RE = re.compile(r"https?://(?:t\.me|telegram\.me)/[^\s]+")
 _TRAILING_JUNK = re.compile(r"[*_~`'\".),!?\]>]+$")
 
@@ -434,10 +439,6 @@ def _clean_url(url: str) -> str:
 
 
 def _extract_links(message) -> list:
-    """
-    Extract ALL Telegram bot/deep links from a message.
-    Returns a deduplicated list of URL strings in order found.
-    """
     text = (getattr(message, 'text', None) or
             getattr(message, 'message', None) or
             getattr(message, 'caption', None) or "")
@@ -476,12 +477,12 @@ def _extract_links(message) -> list:
 
 
 def _extract_link(message) -> str | None:
-    """Legacy single-link helper — returns the first link found, or None."""
     links = _extract_links(message)
     return links[0] if links else None
 
 
-async def click_bot_link_and_get_files(link: str) -> list:
+async def click_bot_link_and_get_files(link: str, client=None) -> list:
+    client = client or _client()
     import re as _re
     deep_link_re = _re.compile(r"https://t\.me/([^?/]+)\?start=(.+)")
     m = deep_link_re.match(link)
@@ -491,7 +492,7 @@ async def click_bot_link_and_get_files(link: str) -> list:
     bot_username = m.group(1)
     start_param  = m.group(2)
 
-    async with userbot.conversation(bot_username, timeout=30) as conv:
+    async with client.conversation(bot_username, timeout=30) as conv:
         await conv.send_message(f"/start {start_param}")
         resp = await conv.get_response()
 
@@ -504,7 +505,7 @@ async def click_bot_link_and_get_files(link: str) -> list:
                 for row in resp.reply_markup.rows:
                     for btn in row.buttons:
                         if hasattr(btn, "data"):
-                            answer = await userbot(GetBotCallbackAnswerRequest(
+                            answer = await client(GetBotCallbackAnswerRequest(
                                 peer=bot_username,
                                 msg_id=resp.id,
                                 data=btn.data,

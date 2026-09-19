@@ -1,8 +1,9 @@
 """
-Main entry point — runs the health-check web server, userbot and admin bot concurrently.
+Main entry point — runs the health-check web server, the userbot pool and the
+admin bot concurrently.
 
-Render requires the process to bind PORT within the first 60 s,
-so the aiohttp server starts first.
+Render requires the process to bind PORT within the first 60 s, so the
+aiohttp server starts first.
 """
 import asyncio
 import sys
@@ -15,6 +16,7 @@ from aiohttp import web
 from bot.app import build_app
 from bot.processor import process_post
 import userbot.client as ub
+import userbot.pool as pool
 from config import PORT
 from database import get_config
 
@@ -37,14 +39,14 @@ async def _start_web_server() -> None:
     await asyncio.Event().wait()          # run forever
 
 
-# ── Userbot ───────────────────────────────────────────────────────────────────
+# ── Userbot pool ──────────────────────────────────────────────────────────────
 
 async def _run_userbot() -> None:
-    if await ub.is_authorized():
-        print("[userbot] Session found — starting listener.")
+    if pool.live_accounts():
+        print(f"[userbot] {len(pool.live_accounts())} account(s) loaded — starting listener.")
         ub.login_done.set()
     else:
-        print("[userbot] No session — waiting for /login command in bot...")
+        print("[userbot] No accounts — waiting for /login in the admin bot...")
         await ub.login_done.wait()
         print("[userbot] Login complete — starting listener.")
     await ub.begin_listening()
@@ -53,20 +55,18 @@ async def _run_userbot() -> None:
 # ── Admin bot (python-telegram-bot) ──────────────────────────────────────────
 
 async def _notify_admins_restart(app) -> None:
-    """Send a restart notice to every configured admin and the log channel. Non-fatal if it fails."""
     try:
         cfg = await get_config()
         log_channel = cfg.get("log_channel")
         admins = cfg.get("admins", [])
+        accounts = len(pool.live_accounts())
+
+        note = f"🔄 *Bot restarted* and is back online.\n👤 Userbot accounts ready: `{accounts}`"
 
         if log_channel:
             try:
-                await app.bot.send_message(
-                    log_channel,
-                    "🔄 *Bot restarted* and is back online.",
-                    parse_mode="Markdown",
-                )
-                print(f"[bot] Restart notice sent to log channel.")
+                await app.bot.send_message(log_channel, note, parse_mode="Markdown")
+                print("[bot] Restart notice sent to log channel.")
             except Exception as e:
                 print(f"[bot] Could not notify log channel: {e}")
 
@@ -75,11 +75,7 @@ async def _notify_admins_restart(app) -> None:
             return
         for admin_id in admins:
             try:
-                await app.bot.send_message(
-                    admin_id,
-                    "🔄 *Bot restarted* and is back online.",
-                    parse_mode="Markdown",
-                )
+                await app.bot.send_message(admin_id, note, parse_mode="Markdown")
             except Exception as e:
                 print(f"[bot] Could not notify admin {admin_id}: {e}")
     except Exception as e:
@@ -98,7 +94,7 @@ async def _run_ptb(app) -> None:
         drop_pending_updates=True,
         allowed_updates=["message", "callback_query"],
     )
-    print("[bot] Admin bot started. Send /login to authenticate the userbot.")
+    print("[bot] Admin bot started. Send /login to add a userbot account.")
     await _notify_admins_restart(app)
     await asyncio.Event().wait()
 
@@ -106,14 +102,12 @@ async def _run_ptb(app) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    print("[main] Starting TG Automation Bot...")
+    print("[main] Starting TG Automation Bot (multi-account)…")
 
-    # init_client is now async — it loads the session from MongoDB if available
-    await ub.init_client()
-    await ub.connect()
+    await ub.init_client()    # loads + connects every stored account
 
     async def on_new_post(message, links):
-        await process_post(message, links, ub.userbot, None)
+        await process_post(message, links, None, None)
 
     ub.set_forward_callback(on_new_post)
     ptb_app = build_app()

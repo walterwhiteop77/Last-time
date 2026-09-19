@@ -222,7 +222,9 @@ HELP_TEXT = """
 ━━━━━━━━━━━━━━━━━━━━
 /enable — Start live monitoring
 /disable — Stop automation + cancel scan
-/stop — Cancel running scan only
+/stop — Cancel ALL running jobs instantly
+/jobs — Show running jobs + progress
+/cancel `<id>` — Cancel one job
 /status — Show full current config
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -388,23 +390,71 @@ async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
+    from bot import jobs
     await update_config("active", False)
+    killed = jobs.cancel_all()
     ub.cancel_scan()
     await update.message.reply_text(
-        "⏸ Automation *disabled*. Any running scan has been stopped.",
+        f"⏸ Automation *disabled*. {killed} running job(s) stopped.",
         parse_mode="Markdown",
     )
 
 
 @admin_only
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hard-stop every running job immediately (no restart needed)."""
+    import asyncio
     import userbot.client as ub
+    from bot import jobs
+
+    killed = jobs.cancel_all()
     ub.cancel_scan()
+
+    async def _release_flag():
+        # Let the cancellation propagate, then clear the flag so new posts
+        # and new commands work again without restarting the bot.
+        await asyncio.sleep(3)
+        ub.reset_scan_cancel()
+
+    asyncio.ensure_future(_release_flag())
+
     await update.message.reply_text(
-        "⛔ Scan stopped. Automation is still *enabled* for new posts.\n"
+        f"⛔ Stopped — *{killed}* running job(s) cancelled.\n"
+        "The bot stays online and automation is still *enabled* for new posts.\n"
         "Use `/disable` to fully stop automation.",
         parse_mode="Markdown",
     )
+
+
+@admin_only
+async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from bot import jobs
+    running = jobs.running_jobs()
+    if not running:
+        await update.message.reply_text("💤 No job is running right now.")
+        return
+    lines = "\n".join(j.describe() for j in running)
+    await update.message.reply_text(
+        f"⚙️ *Running jobs*\n\n{lines}\n\n"
+        "Cancel one with `/cancel <id>` or all with `/stop`.",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_cancel_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from bot import jobs
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/cancel <job_id>` — see `/jobs`. Use `/stop` to cancel everything.",
+            parse_mode="Markdown",
+        )
+        return
+    job_id = context.args[0].strip()
+    if jobs.cancel_job(job_id):
+        await update.message.reply_text(f"⛔ Job `{job_id}` cancelled.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ No running job with id `{job_id}`.", parse_mode="Markdown")
 
 
 @admin_only
@@ -438,6 +488,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 Save mode: `{mode}` (`/setmode`)\n"
         f"⏱ Post gap: `{delays['between_posts']}s` · file gap: `{delays['between_copies']}s` (`/delays`)\n"
     )
+    from bot import jobs
+    running = jobs.running_jobs()
+    if running:
+        text += "\n⚙️ *Running jobs*\n" + "\n".join(j.describe() for j in running) + "\n"
+    else:
+        text += "\n⚙️ No job running\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -550,36 +606,48 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         desc = f"last *{limit}* posts"
 
-    await update.message.reply_text(
-        f"🔍 Scanning {desc} in source channel…\n_(use /stop to cancel at any time)_",
-        parse_mode="Markdown",
-    )
-
+    from bot import jobs
     from bot.processor import process_post
 
-    async def callback(message, links):
-        await process_post(message, links, ub.userbot, None)
+    ub.reset_scan_cancel()
+    chat_id = update.effective_chat.id
+    bot = context.bot
 
-    count = await ub.scan_channel(source, callback, min_id=min_id, limit=limit)
+    async def run(job):
+        async def callback(message, links):
+            job.progress = f"post {getattr(message[0] if isinstance(message, list) else message, 'id', '?')}"
+            await process_post(message, links, ub.userbot, None)
 
-    if count > 0 and min_id:
-        try:
-            entity = await ub.userbot.get_entity(source)
-            msgs = await ub.userbot.get_messages(entity, limit=1)
-            if msgs:
-                await update_config("scan_start_id", msgs[0].id)
-                new_start = msgs[0].id
-                await update.message.reply_text(
-                    f"✅ Scan complete — *{count}* post(s) processed.\n"
-                    f"📌 Start ID auto-advanced to `{new_start}`.",
-                    parse_mode="Markdown",
-                )
-                return
-        except Exception:
-            pass
+        count = await ub.scan_channel(source, callback, min_id=min_id, limit=limit)
+
+        if count > 0 and min_id:
+            try:
+                entity = await ub.userbot.get_entity(source)
+                msgs = await ub.userbot.get_messages(entity, limit=1)
+                if msgs:
+                    await update_config("scan_start_id", msgs[0].id)
+                    await bot.send_message(
+                        chat_id,
+                        f"✅ Scan complete — *{count}* post(s) processed.\n"
+                        f"📌 Start ID auto-advanced to `{msgs[0].id}`.",
+                        parse_mode="Markdown",
+                    )
+                    return
+            except Exception:
+                pass
+
+        await bot.send_message(
+            chat_id,
+            f"✅ Scan complete — *{count}* post(s) with links processed.",
+            parse_mode="Markdown",
+        )
+
+    job = jobs.start_job("scan", desc, run, chat_id, update.effective_user.id)
 
     await update.message.reply_text(
-        f"✅ Scan complete — *{count}* post(s) with links processed.",
+        f"🔍 Scanning {desc} in source channel…\n"
+        f"Job id `{job.id}` — the bot stays fully usable while this runs.\n"
+        "_Cancel with /stop (all) or /cancel " + job.id + "._",
         parse_mode="Markdown",
     )
 
@@ -605,18 +673,28 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Source channel not set. Use /setsource first.")
         return
 
-    await update.message.reply_text(f"⏳ Fetching and processing message `{msg_id}`…", parse_mode="Markdown")
-
+    from bot import jobs
     from bot.processor import process_post
 
-    async def callback(message, links):
-        await process_post(message, links, ub.userbot, None)
+    ub.reset_scan_cancel()
+    chat_id = update.effective_chat.id
+    bot = context.bot
 
-    found = await ub.process_single(source, msg_id, callback)
-    if found:
-        await update.message.reply_text("✅ Message queued for processing. Check logs for progress.")
-    else:
-        await update.message.reply_text("❌ Message not found or has no bot link.")
+    async def run(job):
+        async def callback(message, links):
+            await process_post(message, links, ub.userbot, None)
+
+        found = await ub.process_single(source, msg_id, callback)
+        await bot.send_message(
+            chat_id,
+            "✅ Message processed." if found else "❌ Message not found or has no bot link.",
+        )
+
+    job = jobs.start_job("process", f"msg {msg_id}", run, chat_id, update.effective_user.id)
+    await update.message.reply_text(
+        f"⏳ Processing message `{msg_id}` in the background (job `{job.id}`).",
+        parse_mode="Markdown",
+    )
 
 
 @admin_only
@@ -836,21 +914,30 @@ async def cmd_fbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Source channel not set. Use /setsource first.")
         return
 
-    await update.message.reply_text(
-        f"🔍 Scanning messages `{start_id}` → `{end_id}` in source channel…\n"
-        f"_(use /stop or /disable to cancel at any time)_",
-        parse_mode="Markdown",
-    )
-
+    from bot import jobs
     from bot.processor import process_post
 
-    async def callback(message, links):
-        await process_post(message, links, ub.userbot, None)
+    ub.reset_scan_cancel()
+    chat_id = update.effective_chat.id
+    bot = context.bot
 
-    count = await ub.scan_range(source, start_id, end_id, callback)
+    async def run(job):
+        async def callback(message, links):
+            job.progress = f"post {getattr(message[0] if isinstance(message, list) else message, 'id', '?')}"
+            await process_post(message, links, ub.userbot, None)
+
+        count = await ub.scan_range(source, start_id, end_id, callback)
+        await bot.send_message(
+            chat_id,
+            f"✅ Batch complete — *{count}* post(s) with links processed.",
+            parse_mode="Markdown",
+        )
+
+    job = jobs.start_job("fbatch", f"{start_id} → {end_id}", run, chat_id, update.effective_user.id)
 
     await update.message.reply_text(
-        f"✅ Batch complete — *{count}* post(s) with links processed.",
+        f"🔍 Scanning messages `{start_id}` → `{end_id}` in the background (job `{job.id}`).\n"
+        "The bot stays fully usable — cancel with `/stop` or `/cancel " + job.id + "`.",
         parse_mode="Markdown",
     )
 
@@ -1205,6 +1292,8 @@ def register_handlers(app):
     app.add_handler(CommandHandler("disablecmd",   cmd_disable_cmd))
     app.add_handler(CommandHandler("listcmds",     cmd_list_cmds))
     app.add_handler(CommandHandler("stop",         cmd_stop))
+    app.add_handler(CommandHandler("jobs",         cmd_jobs))
+    app.add_handler(CommandHandler("cancel",       cmd_cancel_job))
     app.add_handler(CommandHandler("setstart",     cmd_set_start))
     app.add_handler(CommandHandler("scan",         cmd_scan))
     app.add_handler(CommandHandler("fbatch",       cmd_fbatch))

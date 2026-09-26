@@ -1071,11 +1071,21 @@ async def cmd_fbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await process_post(message, links, None, None, ws=uid)
 
         count = await ub.scan_range(source, start_id, end_id, callback, ws=uid)
-        await bot.send_message(
-            chat_id,
-            f"✅ Batch complete — *{count}* post(s) with links processed.",
-            parse_mode="Markdown",
-        )
+        st = ub.last_scan_stats.get(uid, {})
+        msg = (f"✅ Batch complete — {count} post(s) with bot links processed.\n"
+               f"Messages read from {source}: {st.get('read', '?')}")
+        if st.get("error"):
+            msg += f"\n⚠️ {st['error']}"
+        if not count:
+            if not st.get("read"):
+                msg += ("\n\nNo messages were found in that ID range. Check the IDs (open a post → "
+                        "Copy link, the number at the end is the ID) and that your logged-in account "
+                        "has joined the source channel (/joinall).")
+            elif st.get("other_links"):
+                msg += "\n\nLinks seen, but none were bot ?start= links:\n" + "\n".join(st["other_links"][:10])
+            else:
+                msg += "\n\nThe messages contain no links at all."
+        await bot.send_message(chat_id, msg, disable_web_page_preview=True)
 
     job = jobs.start_job("fbatch", f"{start_id} → {end_id}", run, chat_id, uid, ws=uid)
 

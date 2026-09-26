@@ -186,6 +186,17 @@ async def process_post(messages, links, _unused_client=None, bot_app=None, ws=No
 
     if isinstance(links, str):
         links = [links]
+    # Keep only bot ?start= links (invite / channel links can never give files)
+    from userbot.client import normalize_bot_link
+    _clean = []
+    for l in links or []:
+        n = normalize_bot_link(l)
+        if n and n not in _clean:
+            _clean.append(n)
+    links = _clean
+    if not links:
+        print("[processor] Post has no bot ?start= links — skipped")
+        return
     if isinstance(messages, TelethonMessage):
         messages = [messages]
 
@@ -405,19 +416,25 @@ def _message_to_html(messages) -> str:
 
 
 def _replace_link_in_html(html: str, original_link: str, new_link: str) -> str:
-    _junk = re.compile(r"[*_~`'\".),!?\]>]+$")
-    original_link = _junk.sub("", original_link)
-
-    path = re.sub(r"https?://(?:t\.me|telegram\.me)/", "", original_link)
-    if not path:
-        return html
-
-    link_pattern = re.compile(
-        r"https?://(?:t\.me|telegram\.me)/" + re.escape(path)
-    )
-    result = link_pattern.sub(new_link, html)
+    """Replace every form of the bot link (t.me / telegram.me / telegram.dog,
+    with or without https://, &amp;-escaped) with new_link."""
+    m = re.match(r"https://t\.me/([^?]+)\?start=(.+)", original_link or "")
+    if m:
+        bot, param = m.group(1), m.group(2)
+        pattern = re.compile(
+            r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/"
+            + re.escape(bot) + r"/?\?(?:[^\s\"'<>]*?(?:&|&amp;))?start=" + re.escape(param)
+            + r"[^\s\"'<>]*", re.I)
+    else:
+        path = re.sub(r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/", "", original_link or "")
+        if not path:
+            return html
+        pattern = re.compile(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/" + re.escape(path), re.I)
+    result = pattern.sub(new_link, html)
     if result == html:
-        print(f"[processor] Link not found in HTML — no replacement: {original_link}")
+        # Link was only in a button (user accounts cannot post buttons) — add it as text
+        print("[processor] Link not in text (probably a button) — appending new link")
+        result = (html + "\n\n" if html else "") + f'<a href="{new_link}">{new_link}</a>'
     else:
         print(f"[processor] Replaced: {original_link} → {new_link}")
     return result
@@ -937,6 +954,13 @@ async def _send_to_output(original_msgs, html_text: str, new_link: str, output_c
         print(f"[processor] Output channel {output_channel} unreachable — post {primary_id} skipped")
         return
 
+    if has_media and html_text and len(tl_html.parse(html_text)[0]) > 1024:
+        print("[processor] Caption longer than 1024 chars — sending text separately")
+        caption_overflow = html_text
+        html_text = ""
+    else:
+        caption_overflow = None
+
     need_download = has_media and await _should_download(cfg, original_msgs[0])
     paths, tmp_dir = ([], None)
     if need_download:
@@ -976,6 +1000,9 @@ async def _send_to_output(original_msgs, html_text: str, new_link: str, output_c
                         parse_mode="html",
                         link_preview=False,
                     )
+                if caption_overflow:
+                    await client.send_message(target, caption_overflow,
+                                              parse_mode="html", link_preview=False)
                 print(f"[processor] Post {primary_id} sent to output channel")
                 return
             except FloodWaitError as e:

@@ -389,21 +389,45 @@ async def scan_recent(source: str, limit: int, callback, after_id: int = 0, ws=N
 async def scan_range(source: str, start_id: int, end_id: int, callback, ws=None) -> int:
     ws = _ws(ws)
     client = _client(ws)
+    stats = {"source": source, "read": 0, "matched": 0, "error": None, "other_links": []}
+    last_scan_stats[ws] = stats
     try:
         entity = await _resolve_entity(source, client, ws)
     except Exception as e:
         print(f"[userbot:{ws}] scan_range: {e}")
+        stats["error"] = f"Cannot open source channel {source}: {e}"
         return 0
 
     all_messages = []
-    async for message in client.iter_messages(entity, min_id=start_id - 1, max_id=end_id):
-        all_messages.append(message)
-    all_messages.reverse()
+    try:
+        # min_id / max_id are exclusive in Telegram, so widen by one on both ends
+        async for message in client.iter_messages(entity, min_id=start_id - 1, max_id=end_id + 1):
+            all_messages.append(message)
+    except Exception as e:
+        stats["error"] = f"Reading messages failed: {e}"
+        print(f"[userbot:{ws}] scan_range read error: {e}")
+    if not all_messages:
+        # fallback: fetch explicit IDs (works even when history paging is restricted)
+        try:
+            ids = list(range(start_id, end_id + 1))
+            for i in range(0, len(ids), 100):
+                got = await client.get_messages(entity, ids=ids[i:i + 100])
+                all_messages += [m for m in (got or []) if m]
+        except Exception as e:
+            stats["error"] = stats["error"] or f"Reading messages failed: {e}"
+    all_messages.sort(key=lambda m: m.id)
+    stats["read"] = len(all_messages)
 
     groups = _group_by_album(all_messages)
     matched = [(g, l) for g in groups if (l := _links_for_group(g))]
+    stats["matched"] = len(matched)
+    if not matched:
+        for m in all_messages[:50]:
+            for u in _all_urls(m):
+                if u not in stats["other_links"]:
+                    stats["other_links"].append(u)
 
-    print(f"[userbot:{ws}] scan_range: {len(matched)} post(s) with links")
+    print(f"[userbot:{ws}] scan_range: read {len(all_messages)} msg(s), {len(matched)} post(s) with bot links")
 
     reset_scan_cancel(ws)
     processed = 0
@@ -472,7 +496,52 @@ def normalize_bot_link(url: str) -> str | None:
     return f"https://t.me/{m.group(1)}?start={m.group(2)}"
 
 
+last_scan_stats: dict = {}
+
+
+def _all_urls(message) -> list:
+    """Every URL-ish string in a message: text, hidden links, buttons, link previews."""
+    text = (getattr(message, 'text', None) or getattr(message, 'message', None) or "")
+    raw_text = getattr(message, 'raw_text', None) or getattr(message, 'message', None) or text
+    out = []
+    for entity in (getattr(message, "entities", None) or []):
+        try:
+            if getattr(entity, "url", None):
+                out.append(entity.url)
+            elif isinstance(entity, MessageEntityUrl):
+                out.append(raw_text[entity.offset:entity.offset + entity.length])
+        except Exception:
+            pass
+    for src in (raw_text, text):
+        out += [m.group(0) for m in TG_LINK_RE.finditer(src or "")]
+        out += [m.group(0) for m in TG_RESOLVE_RE.finditer(src or "")]
+    try:
+        rm = getattr(message, "reply_markup", None)
+        for row in (getattr(rm, "rows", None) or []):
+            for btn in row.buttons:
+                if getattr(btn, "url", None):
+                    out.append(btn.url)
+    except Exception:
+        pass
+    try:
+        wp = getattr(getattr(message, "media", None), "webpage", None)
+        if getattr(wp, "url", None):
+            out.append(wp.url)
+    except Exception:
+        pass
+    return [_clean_url(u) for u in out if u]
+
+
 def _extract_links(message) -> list:
+    seen = {}
+    for c in _all_urls(message):
+        n = normalize_bot_link(c)
+        if n and n not in seen:
+            seen[n] = True
+    return list(seen.keys())
+
+
+def _extract_links_old(message) -> list:
     text = (getattr(message, 'text', None) or
             getattr(message, 'message', None) or
             getattr(message, 'caption', None) or "")

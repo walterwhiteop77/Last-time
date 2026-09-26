@@ -21,7 +21,6 @@ from config import PORT
 from database import (
     get_config,
     get_admins,
-    get_owner,
     list_workspaces,
     migrate_legacy,
     ensure_workspace,

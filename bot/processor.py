@@ -46,7 +46,8 @@ from telethon.extensions import html as tl_html
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from database import get_config, get_delays, save_file_mapping, log_event
+import database as dbm
+from database import get_config, get_delays, save_file_mapping, log_event, set_ws
 import userbot.pool as pool
 
 # ── Regex helpers ─────────────────────────────────────────────────────────────
@@ -60,17 +61,29 @@ URL_RE    = re.compile(r"https?://[^\s]+")
 TG_URL_RE = re.compile(r"https?://(?:t\.me|telegram\.me)/\S+")
 AT_RE     = re.compile(r"@\w{3,}")
 
-# Only ONE post processed at a time
-_processing_lock = asyncio.Lock()
-_current_task: asyncio.Task | None = None
+# One post at a time PER WORKSPACE — different admins run fully in parallel.
+_locks: dict[int, asyncio.Lock] = {}
+_current_tasks: dict[int, asyncio.Task] = {}
 
 
-def cancel_current_processing():
-    """Immediately cancel whatever post is currently being processed, if any."""
-    global _current_task
-    if _current_task and not _current_task.done():
-        print("[processor] Cancel requested — stopping current task immediately")
-        _current_task.cancel()
+def _ws() -> int:
+    return dbm._resolve()
+
+
+def _lock_for(ws: int) -> asyncio.Lock:
+    if ws not in _locks:
+        _locks[ws] = asyncio.Lock()
+    return _locks[ws]
+
+
+def cancel_current_processing(ws=None):
+    """Cancel the post currently being processed for one workspace (or all)."""
+    targets = [int(ws)] if ws is not None else list(_current_tasks.keys())
+    for uid in targets:
+        task = _current_tasks.get(uid)
+        if task and not task.done():
+            print(f"[processor:{uid}] Cancel requested — stopping current task")
+            task.cancel()
 
 
 # ── Cancellation helpers ──────────────────────────────────────────────────────
@@ -78,7 +91,7 @@ def cancel_current_processing():
 def _is_cancelled() -> bool:
     try:
         import userbot.client as _ub
-        return _ub._scan_cancelled
+        return _ub.is_cancelled()
     except Exception:
         return False
 
@@ -109,6 +122,23 @@ async def _pick_worker(cfg):
 async def _listener_client():
     acc = await pool.listener_account()
     return acc.client if acc else None
+
+
+MAX_FLOOD_PAUSE = int(os.environ.get("MAX_FLOOD_PAUSE", "20"))
+
+
+async def _flood_pause(wait: float):
+    """Never freeze the whole job on a long FloodWait: the flooded account is
+    already marked as cooling, so pause briefly and let the next attempt use
+    another account. Only sleeps the full wait if no other account is free."""
+    try:
+        live = pool.live_accounts(_ws())
+        others_ready = any(not a.cooling for a in live)
+    except Exception:
+        others_ready = False
+    pause = min(wait, MAX_FLOOD_PAUSE) if others_ready else min(wait, 300)
+    print(f"[processor] flood pause {int(pause)}s (requested {int(wait)}s, other accounts ready={others_ready})")
+    await _sleep_cancellable(pause)
 
 
 def _note_flood(acc, seconds: float):
@@ -142,36 +172,40 @@ async def _should_download(cfg, message) -> bool:
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-async def process_post(messages, links, _unused_client=None, bot_app=None):
+async def process_post(messages, links, _unused_client=None, bot_app=None, ws=None):
     """
-    Process one source-channel post end-to-end.
+    Process one source-channel post end-to-end for ONE workspace.
     `messages` is a single Telethon Message or a list (album).
     `links` may be a single URL string or a list of URL strings.
-    Queues behind _processing_lock so concurrent calls serialise.
+    Posts of the same workspace queue behind that workspace's lock; different
+    workspaces (admins) run fully in parallel.
     """
+    if ws is not None:
+        set_ws(ws)
+    uid = _ws()
+
     if isinstance(links, str):
         links = [links]
     if isinstance(messages, TelethonMessage):
         messages = [messages]
 
-    global _current_task
     primary_id = messages[0].id
-    delays = await get_delays()
+    delays = await get_delays(uid)
 
-    async with _processing_lock:
+    async with _lock_for(uid):
         if _is_cancelled():
-            print(f"[processor] /stop active — skipping post {primary_id}")
+            print(f"[processor:{uid}] /stop active — skipping post {primary_id}")
             return
 
         task = asyncio.ensure_future(_process_post_inner(messages, links))
-        _current_task = task
+        _current_tasks[uid] = task
         try:
             await task
         except asyncio.CancelledError:
-            print(f"[processor] Post {primary_id} processing stopped by /stop")
+            print(f"[processor:{uid}] Post {primary_id} stopped by /stop")
         finally:
-            if _current_task is task:
-                _current_task = None
+            if _current_tasks.get(uid) is task:
+                _current_tasks.pop(uid, None)
 
         if not _is_cancelled():
             await _sleep_cancellable(delays["between_posts"])
@@ -560,7 +594,15 @@ async def _store_in_db(client, worker, db_ch, file_msg, keep_caption, cfg, delay
             wait = e.seconds + 5
             _note_flood(worker, wait)
             print(f"[processor] FloodWait on DB copy — waiting {wait}s (attempt {attempt + 1}/3)")
-            await _sleep_cancellable(wait)
+            await _flood_pause(wait)
+            try:
+                nw = await pool.next_worker(_ws())
+                if nw and not nw.cooling and nw.client:
+                    worker, client = nw, nw.client
+                    target = await _resolve_target(client, db_ch) or target
+                    print(f"[processor] switched to account {nw.index} after flood")
+            except Exception:
+                pass
             if _is_cancelled():
                 return None
         except Exception as e:
@@ -617,7 +659,7 @@ async def _upload_via_download(client, worker, target, file_msg, caption: str, d
         wait = e.seconds + 5
         _note_flood(worker, wait)
         print(f"[processor] FloodWait during re-upload — waiting {wait}s")
-        await _sleep_cancellable(wait)
+        await _flood_pause(wait)
         return None
     except Exception as e:
         print(f"[processor] Download + re-upload failed: {e}")
@@ -673,7 +715,7 @@ async def _get_files_from_link(link: str, client, worker, delays, _retry: bool =
         wait = e.seconds + 5
         _note_flood(worker, wait)
         print(f"[processor] FloodWait on conversation — waiting {wait}s")
-        await _sleep_cancellable(wait)
+        await _flood_pause(wait)
         if not _is_cancelled() and not _retry:
             return await _get_files_from_link(link, client, worker, delays, _retry=True)
     except Exception as e:
@@ -742,7 +784,7 @@ async def _genlink_single(bot: str, link: str, acc, delays) -> str | None:
         wait = e.seconds + 5
         _note_flood(acc, wait)
         print(f"[processor] FloodWait on /genlink — waiting {wait}s")
-        await _sleep_cancellable(wait)
+        await _flood_pause(wait)
     except Exception as e:
         print(f"[processor] /genlink failed: {e}")
     return None
@@ -806,7 +848,7 @@ async def _batch_conversational(bot: str, db_links: list, acc, delays) -> str | 
         wait = e.seconds + 5
         _note_flood(acc, wait)
         print(f"[processor] FloodWait on /batch — waiting {wait}s")
-        await _sleep_cancellable(wait)
+        await _flood_pause(wait)
     except Exception as e:
         print(f"[processor] /batch failed: {e}")
     return None
@@ -940,7 +982,7 @@ async def _send_to_output(original_msgs, html_text: str, new_link: str, output_c
                 wait = e.seconds + 5
                 _note_flood(acc, wait)
                 print(f"[processor] FloodWait on output — waiting {wait}s (attempt {attempt+1}/3)")
-                await _sleep_cancellable(wait)
+                await _flood_pause(wait)
             except Exception as e:
                 print(f"[processor] Output send failed (attempt {attempt+1}/3): {e}")
                 if has_media and not need_download and not paths:

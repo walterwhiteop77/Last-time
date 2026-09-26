@@ -1,9 +1,9 @@
 """
-Main entry point — runs the health-check web server, the userbot pool and the
-admin bot concurrently.
+Main entry point — runs the health-check web server, every workspace's userbot
+accounts and the admin bot concurrently.
 
-Render requires the process to bind PORT within the first 60 s, so the
-aiohttp server starts first.
+Each admin owns an isolated workspace (own accounts, own channels, own jobs),
+so several people can run their own automations side by side.
 """
 import asyncio
 import sys
@@ -18,7 +18,15 @@ from bot.processor import process_post
 import userbot.client as ub
 import userbot.pool as pool
 from config import PORT
-from database import get_config
+from database import (
+    get_config,
+    get_admins,
+    get_owner,
+    list_workspaces,
+    migrate_legacy,
+    ensure_workspace,
+    set_ws,
+)
 
 
 # ── Render health-check web server ────────────────────────────────────────────
@@ -39,43 +47,39 @@ async def _start_web_server() -> None:
     await asyncio.Event().wait()          # run forever
 
 
-# ── Userbot pool ──────────────────────────────────────────────────────────────
+# ── Userbot listeners (one per workspace) ─────────────────────────────────────
 
-async def _run_userbot() -> None:
-    if pool.live_accounts():
-        print(f"[userbot] {len(pool.live_accounts())} account(s) loaded — starting listener.")
-        ub.login_done.set()
-    else:
-        print("[userbot] No accounts — waiting for /login in the admin bot...")
-        await ub.login_done.wait()
-        print("[userbot] Login complete — starting listener.")
-    await ub.begin_listening()
+async def _run_userbots() -> None:
+    asyncio.create_task(pool.watchdog())
+    started = await ub.start_all_listeners()
+    print(f"[userbot] {started} workspace listener(s) started.")
+    if not started:
+        print("[userbot] No accounts yet — waiting for /login in the admin bot…")
+    await asyncio.Event().wait()
 
 
 # ── Admin bot (python-telegram-bot) ──────────────────────────────────────────
 
 async def _notify_admins_restart(app) -> None:
     try:
-        cfg = await get_config()
-        log_channel = cfg.get("log_channel")
-        admins = cfg.get("admins", [])
-        accounts = len(pool.live_accounts())
-
-        note = f"🔄 *Bot restarted* and is back online.\n👤 Userbot accounts ready: `{accounts}`"
-
-        if log_channel:
-            try:
-                await app.bot.send_message(log_channel, note, parse_mode="Markdown")
-                print("[bot] Restart notice sent to log channel.")
-            except Exception as e:
-                print(f"[bot] Could not notify log channel: {e}")
-
-        if not admins:
-            print("[bot] No admins configured — skipping admin restart notification.")
-            return
+        admins = await get_admins()
         for admin_id in admins:
             try:
+                set_ws(admin_id)
+                cfg = await get_config(admin_id)
+                accounts = len(pool.live_accounts(admin_id))
+                note = (
+                    "🔄 *Bot restarted* and is back online.\n"
+                    f"👤 Your userbot accounts ready: `{accounts}`\n"
+                    f"📥 Your source: `{cfg.get('source_channel') or 'not set'}`"
+                )
                 await app.bot.send_message(admin_id, note, parse_mode="Markdown")
+                log_channel = cfg.get("log_channel")
+                if log_channel:
+                    try:
+                        await app.bot.send_message(log_channel, note, parse_mode="Markdown")
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"[bot] Could not notify admin {admin_id}: {e}")
     except Exception as e:
@@ -102,12 +106,20 @@ async def _run_ptb(app) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    print("[main] Starting TG Automation Bot (multi-account)…")
+    print("[main] Starting TG Automation Bot (multi-user, multi-account)…")
 
-    await ub.init_client()    # loads + connects every stored account
+    owner = await migrate_legacy()
+    if owner:
+        await ensure_workspace(owner)
+        print(f"[main] Owner: {owner}")
+    for admin in await get_admins():
+        await ensure_workspace(admin)
 
-    async def on_new_post(message, links):
-        await process_post(message, links, None, None)
+    await pool.load_all()          # connect every workspace's accounts
+    print(f"[main] Workspaces: {await list_workspaces()}")
+
+    async def on_new_post(message, links, ws):
+        await process_post(message, links, None, None, ws=ws)
 
     ub.set_forward_callback(on_new_post)
     ptb_app = build_app()
@@ -115,7 +127,7 @@ async def main() -> None:
     await asyncio.gather(
         _start_web_server(),
         _run_ptb(ptb_app),
-        _run_userbot(),
+        _run_userbots(),
     )
 
 

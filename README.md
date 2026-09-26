@@ -16,6 +16,29 @@ rate-limited by Telegram.
 
 ## What's new in this version
 
+### 0. Separate workspace for every user
+
+Each authorised user gets their **own private setup**, stored under
+`ws:<telegram_user_id>` in MongoDB:
+
+* their own logged-in accounts (`/login` adds accounts to *their* pool)
+* their own source / storage / output channels and second bot
+* their own delays, rules, caption and mode settings
+* their own listener and their own jobs
+
+Two people can run completely different jobs on different accounts and
+different channels **at the same time** — nothing is shared, and nobody can
+see or cancel anyone else's work.
+
+* The first person to talk to a fresh bot becomes the **owner** (or set
+  `OWNER_ID` in the environment).
+* The owner adds people with `/addadmin <user_id>`; each new person starts with
+  an empty workspace and sets it up themselves.
+* `/myspace` — your setup at a glance, `/whoami` — your user ID,
+  `/workspaces` — owner-only overview of everyone.
+* An existing single-user installation is migrated automatically into the
+  owner's workspace on first start, so nothing is lost.
+
 ### 1. Multi-login (a pool of user accounts)
 
 You are no longer limited to one user account. Send `/login` as many times as

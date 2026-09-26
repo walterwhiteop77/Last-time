@@ -7,21 +7,68 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from database import get_config, update_config
+from database import (
+    get_config,
+    update_config,
+    get_admins,
+    get_owner,
+    set_owner,
+    add_admin,
+    remove_admin,
+    ensure_workspace,
+    list_workspaces,
+    set_ws,
+)
 
 # Conversation states for /login
 PHONE, CODE, PASSWORD = range(3)
 
 
+def _uid(update: Update) -> int:
+    return update.effective_user.id
+
+
 def admin_only(func):
+    """
+    Allow listed admins only, and bind this command to the caller's own
+    workspace: their accounts, their channels, their jobs.
+    """
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        cfg = await get_config()
-        admins = cfg.get("admins", [])
-        user_id = update.effective_user.id
-        if admins and user_id not in admins:
-            await update.message.reply_text("⛔ You are not authorized to use this command.")
+        user_id = _uid(update)
+        admins = await get_admins()
+        owner = await get_owner()
+
+        if not admins and not owner:
+            # First person to talk to a fresh bot becomes the owner.
+            await set_owner(user_id)
+            await ensure_workspace(user_id)
+            admins = [user_id]
+
+        if user_id not in [int(a) for a in admins]:
+            await update.message.reply_text(
+                "⛔ You are not authorized to use this bot.\n"
+                f"Ask the owner to run `/addadmin {user_id}`.",
+                parse_mode="Markdown",
+            )
             return
+
+        set_ws(user_id)
+        await ensure_workspace(user_id)
+        return await func(update, context)
+    return wrapper
+
+
+def owner_only(func):
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = _uid(update)
+        owner = await get_owner()
+        if owner and int(owner) != user_id:
+            await update.message.reply_text("⛔ Only the bot owner can use this command.")
+            return
+        set_ws(user_id)
+        await ensure_workspace(user_id)
         return await func(update, context)
     return wrapper
 
@@ -138,14 +185,19 @@ async def _finish_login(update: Update):
     if targets:
         joined = "\nThis account was also subscribed to your configured channels."
 
-    ub.login_done.set()
+    # Start (or keep) this admin's own listener as soon as they have an account
+    try:
+        await ub.ensure_listener(_uid(update))
+    except Exception as e:
+        print(f"[bot] Could not start listener: {e}")
 
     await update.message.reply_text(
-        f"✅ *Account added: {acc.label}* (number `{acc.index}` in the pool)\n\n"
-        f"Accounts now ready: `{len(pool.live_accounts())}`\n"
-        "Session saved — no re-login needed after restarts."
+        f"✅ *Account added: {acc.label}* (number `{acc.index}` in your pool)\n\n"
+        f"Your accounts now ready: `{len(pool.live_accounts())}`\n"
+        "Session saved — no re-login needed after restarts.\n"
+        "This account belongs to *you* only — other admins have their own."
         f"{joined}\n\n"
-        "Use `/accounts` to see the pool, or `/login` again to add one more.",
+        "Use `/accounts` to see your pool, or `/login` again to add one more.",
         parse_mode="Markdown",
     )
 
@@ -166,7 +218,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         "👋 *TG Automation Bot*\n\n"
-        "Send /help to see all admin commands.",
+        "You have your *own private setup*: your own logged-in accounts, your "
+        "own source / storage / output channels, your own settings and your "
+        "own jobs. Nothing is shared with other admins.\n\n"
+        "1️⃣ `/login` — add your Telegram account(s)\n"
+        "2️⃣ `/setsource` `/setdb` `/setoutput` `/setsecondbot`\n"
+        "3️⃣ `/enable` — start\n\n"
+        "Send /help for the full list, /myspace for your current setup.",
         parse_mode="Markdown",
     )
     try:
@@ -189,10 +247,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 HELP_TEXT = """
 🤖 *TG Automation Bot — Admin Commands*
 
+_Everything below applies to YOUR own setup only._
+
+━━━━━━━━━━━━━━━━━━━━
+🏠 *Your workspace*
+━━━━━━━━━━━━━━━━━━━━
+/myspace — Your setup at a glance
+/whoami — Your user ID
+/workspaces — All workspaces (owner only)
+
 ━━━━━━━━━━━━━━━━━━━━
 🔑 *Accounts (multi-login)*
 ━━━━━━━━━━━━━━━━━━━━
-/login — Add another userbot account
+/login — Add another userbot account (yours)
 /accounts — List accounts & their state
 /removeaccount `<n>` — Remove an account
 /pauseaccount `<n>` — Stop giving it work
@@ -214,18 +281,18 @@ HELP_TEXT = """
 ━━━━━━━━━━━━━━━━━━━━
 👥 *Admin Management*
 ━━━━━━━━━━━━━━━━━━━━
-/addadmin `<user_id>` — Grant admin access
-/removeadmin `<user_id>` — Revoke admin access
+/addadmin `<user_id>` — Give someone their own workspace (owner)
+/removeadmin `<user_id>` — Revoke access (owner)
 
 ━━━━━━━━━━━━━━━━━━━━
 ⚙️ *Automation Control*
 ━━━━━━━━━━━━━━━━━━━━
-/enable — Start live monitoring
-/disable — Stop automation + cancel scan
-/stop — Cancel ALL running jobs instantly
-/jobs — Show running jobs + progress
-/cancel `<id>` — Cancel one job
-/status — Show full current config
+/enable — Start live monitoring (your source)
+/disable — Stop your automation + cancel your jobs
+/stop — Cancel all of YOUR running jobs instantly
+/jobs — Show your running jobs + progress
+/cancel `<id>` — Cancel one of your jobs
+/status — Show your current config
 
 ━━━━━━━━━━━━━━━━━━━━
 📥 *Scanning & Processing*
@@ -325,25 +392,30 @@ async def cmd_set_second_bot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"✅ Second bot set to: `@{val}`", parse_mode="Markdown")
 
 
-@admin_only
+@owner_only
 async def cmd_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /addadmin <user_id>")
+        await update.message.reply_text(
+            "Usage: `/addadmin <user_id>`\n"
+            "The user gets their *own empty workspace*: their own accounts, "
+            "channels, settings and jobs.",
+            parse_mode="Markdown",
+        )
         return
     try:
         uid = int(context.args[0])
     except ValueError:
         await update.message.reply_text("❌ User ID must be a number.")
         return
-    cfg = await get_config()
-    admins = cfg.get("admins", [])
-    if uid not in admins:
-        admins.append(uid)
-        await update_config("admins", admins)
-    await update.message.reply_text(f"✅ Admin `{uid}` added.", parse_mode="Markdown")
+    await add_admin(uid)
+    await update.message.reply_text(
+        f"✅ `{uid}` can now use the bot with their own private setup.\n"
+        "They should send /start, then /login and set their own channels.",
+        parse_mode="Markdown",
+    )
 
 
-@admin_only
+@owner_only
 async def cmd_remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /removeadmin <user_id>")
@@ -353,25 +425,85 @@ async def cmd_remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ User ID must be a number.")
         return
-    cfg = await get_config()
-    admins = cfg.get("admins", [])
-    if uid in admins:
-        admins.remove(uid)
-        await update_config("admins", admins)
-        await update.message.reply_text(f"✅ Admin `{uid}` removed.", parse_mode="Markdown")
+    owner = await get_owner()
+    if owner and int(owner) == uid:
+        await update.message.reply_text("❌ The owner cannot be removed.")
+        return
+    if await remove_admin(uid):
+        from bot import jobs
+        jobs.cancel_all(uid)
+        await update.message.reply_text(
+            f"✅ `{uid}` no longer has access. Their saved setup is kept.",
+            parse_mode="Markdown",
+        )
     else:
         await update.message.reply_text("❌ That user is not an admin.")
 
 
 @admin_only
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = _uid(update)
+    owner = await get_owner()
+    role = "owner" if owner and int(owner) == uid else "admin"
+    await update.message.reply_text(
+        f"🪪 Your user ID: `{uid}`\nRole: *{role}*\nYour workspace: `ws:{uid}`",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_myspace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import userbot.pool as pool
+    from bot import jobs
+    uid = _uid(update)
+    cfg = await get_config()
+    running = jobs.running_jobs(uid)
+    await update.message.reply_text(
+        f"🏠 *Your workspace* `ws:{uid}`\n\n"
+        f"👤 Your accounts: `{len(pool.live_accounts(uid))}`\n"
+        f"📥 Source: `{cfg.get('source_channel') or 'not set'}`\n"
+        f"💾 Storage: `{cfg.get('db_channel') or 'not set'}`\n"
+        f"📤 Output: `{cfg.get('output_channel') or 'not set'}`\n"
+        f"🤖 Second bot: `{cfg.get('second_bot_username') or 'not set'}`\n"
+        f"⚙️ Automation: {'🟢 on' if cfg.get('active') else '🔴 off'}\n"
+        f"🧵 Your running jobs: `{len(running)}`\n\n"
+        "_Only you can see or change this setup._",
+        parse_mode="Markdown",
+    )
+
+
+@owner_only
+async def cmd_workspaces(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import userbot.pool as pool
+    from bot import jobs
+    admins = await get_admins()
+    spaces = await list_workspaces()
+    owner = await get_owner()
+    lines = []
+    for ws in sorted(set(list(admins) + list(spaces))):
+        cfg = await get_config(ws)
+        tag = "👑" if owner and int(owner) == int(ws) else "👤"
+        state = "🟢" if cfg.get("active") else "🔴"
+        lines.append(
+            f"{tag} `{ws}` {state} accounts: `{len(pool.live_accounts(ws))}` · "
+            f"jobs: `{len(jobs.running_jobs(ws))}` · src: `{cfg.get('source_channel') or '—'}`"
+        )
+    await update.message.reply_text(
+        "🗂 *All workspaces*\n" + ("\n".join(lines) or "none"),
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
 async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
-    if not await ub.is_authorized():
-        await update.message.reply_text("❌ Userbot is not logged in. Use /login first.")
+    uid = _uid(update)
+    if not await ub.is_authorized(uid):
+        await update.message.reply_text("❌ You have no logged-in account. Use /login first.")
         return
     # Clear any leftover cancel flag from a previous /stop or /disable,
     # otherwise every new post would be silently skipped.
-    ub.reset_scan_cancel()
+    ub.reset_scan_cancel(uid)
     cfg = await get_config()
     missing = [k for k in ["source_channel", "db_channel", "output_channel", "second_bot_username"] if not cfg.get(k)]
     if missing:
@@ -383,45 +515,50 @@ async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_config("active", True)
     source = cfg.get("source_channel")
     await update.message.reply_text("⏳ Joining source channel…")
-    await ub.join_source_channel(source)
-    await update.message.reply_text("✅ Automation is now *enabled*.", parse_mode="Markdown")
+    await ub.join_source_channel(source, None, uid)
+    await ub.ensure_listener(uid)
+    await update.message.reply_text(
+        "✅ Your automation is now *enabled* — your accounts watch your source channel.",
+        parse_mode="Markdown",
+    )
 
 
 @admin_only
 async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
     from bot import jobs
+    uid = _uid(update)
     await update_config("active", False)
-    killed = jobs.cancel_all()
-    ub.cancel_scan()
+    killed = jobs.cancel_all(uid)
+    ub.cancel_scan(uid)
     await update.message.reply_text(
-        f"⏸ Automation *disabled*. {killed} running job(s) stopped.",
+        f"⏸ Your automation is *disabled*. {killed} of your job(s) stopped.\n"
+        "_Other admins are not affected._",
         parse_mode="Markdown",
     )
 
 
 @admin_only
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Hard-stop every running job immediately (no restart needed)."""
+    """Hard-stop this admin's running jobs immediately (no restart needed)."""
     import asyncio
     import userbot.client as ub
     from bot import jobs
 
-    killed = jobs.cancel_all()
-    ub.cancel_scan()
+    uid = _uid(update)
+    killed = jobs.cancel_all(uid)
+    ub.cancel_scan(uid)
 
     async def _release_flag():
-        # Let the cancellation propagate, then clear the flag so new posts
-        # and new commands work again without restarting the bot.
         await asyncio.sleep(3)
-        ub.reset_scan_cancel()
+        ub.reset_scan_cancel(uid)
 
     asyncio.ensure_future(_release_flag())
 
     await update.message.reply_text(
-        f"⛔ Stopped — *{killed}* running job(s) cancelled.\n"
-        "The bot stays online and automation is still *enabled* for new posts.\n"
-        "Use `/disable` to fully stop automation.",
+        f"⛔ Stopped — *{killed}* of your running job(s) cancelled.\n"
+        "The bot stays online and your automation is still *enabled* for new posts.\n"
+        "Use `/disable` to fully stop your automation.",
         parse_mode="Markdown",
     )
 
@@ -429,14 +566,14 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from bot import jobs
-    running = jobs.running_jobs()
+    running = jobs.running_jobs(_uid(update))
     if not running:
-        await update.message.reply_text("💤 No job is running right now.")
+        await update.message.reply_text("💤 None of your jobs are running right now.")
         return
     lines = "\n".join(j.describe() for j in running)
     await update.message.reply_text(
-        f"⚙️ *Running jobs*\n\n{lines}\n\n"
-        "Cancel one with `/cancel <id>` or all with `/stop`.",
+        f"⚙️ *Your running jobs*\n\n{lines}\n\n"
+        "Cancel one with `/cancel <id>` or all of yours with `/stop`.",
         parse_mode="Markdown",
     )
 
@@ -446,24 +583,25 @@ async def cmd_cancel_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from bot import jobs
     if not context.args:
         await update.message.reply_text(
-            "Usage: `/cancel <job_id>` — see `/jobs`. Use `/stop` to cancel everything.",
+            "Usage: `/cancel <job_id>` — see `/jobs`. Use `/stop` to cancel all of yours.",
             parse_mode="Markdown",
         )
         return
     job_id = context.args[0].strip()
-    if jobs.cancel_job(job_id):
+    if jobs.cancel_job(job_id, _uid(update)):
         await update.message.reply_text(f"⛔ Job `{job_id}` cancelled.", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"❌ No running job with id `{job_id}`.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ You have no running job with id `{job_id}`.", parse_mode="Markdown")
 
 
 @admin_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
+    uid = _uid(update)
     cfg = await get_config()
     active = "🟢 Active" if cfg.get("active") else "🔴 Inactive"
     try:
-        authorized = "✅ Logged in" if await ub.is_authorized() else "❌ Not logged in"
+        authorized = "✅ Logged in" if await ub.is_authorized(uid) else "❌ Not logged in"
     except Exception:
         authorized = "❓ Unknown"
     cmds = cfg.get("enabled_commands", [])
@@ -472,28 +610,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.pool as pool
     from database import get_delays
     delays = await get_delays()
-    acc_count = len(pool.live_accounts())
+    acc_count = len(pool.live_accounts(uid))
     mode = (cfg.get("save_mode") or "auto").lower()
     rotate = "on" if cfg.get("rotate_accounts", True) else "off"
     text = (
-        f"*Bot Status*: {active}\n"
-        f"*Userbot*: {authorized} (`{acc_count}` account(s), rotation {rotate})\n\n"
+        f"*Your status*: {active}  (workspace `ws:{uid}`)\n"
+        f"*Your userbot*: {authorized} (`{acc_count}` account(s), rotation {rotate})\n\n"
         f"📥 Source channel: `{cfg.get('source_channel') or 'not set'}`\n"
         f"💾 DB channel: `{cfg.get('db_channel') or 'not set'}`\n"
         f"📤 Output channel: `{cfg.get('output_channel') or 'not set'}`\n"
         f"🤖 Second bot: `{cfg.get('second_bot_username') or 'not set'}`\n"
         f"📝 DB caption: *{caption_state}* (`/setcaption keep|remove`)\n"
-        f"👥 Admins: `{cfg.get('admins', [])}`\n"
         f"🔧 Enabled commands: `{cmd_list}`\n"
         f"📦 Save mode: `{mode}` (`/setmode`)\n"
         f"⏱ Post gap: `{delays['between_posts']}s` · file gap: `{delays['between_copies']}s` (`/delays`)\n"
     )
     from bot import jobs
-    running = jobs.running_jobs()
+    running = jobs.running_jobs(uid)
     if running:
-        text += "\n⚙️ *Running jobs*\n" + "\n".join(j.describe() for j in running) + "\n"
+        text += "\n⚙️ *Your running jobs*\n" + "\n".join(j.describe() for j in running) + "\n"
     else:
-        text += "\n⚙️ No job running\n"
+        text += "\n⚙️ No job of yours running\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -569,8 +706,9 @@ async def cmd_set_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
-    if not await ub.is_authorized():
-        await update.message.reply_text("❌ Userbot not logged in. Use /login first.")
+    uid = _uid(update)
+    if not await ub.is_authorized(uid):
+        await update.message.reply_text("❌ You have no logged-in account. Use /login first.")
         return
     cfg = await get_config()
     source = cfg.get("source_channel")
@@ -608,24 +746,26 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     from bot import jobs
     from bot.processor import process_post
+    import userbot.pool as pool
 
-    ub.reset_scan_cancel()
+    ub.reset_scan_cancel(uid)
     chat_id = update.effective_chat.id
     bot = context.bot
 
     async def run(job):
         async def callback(message, links):
             job.progress = f"post {getattr(message[0] if isinstance(message, list) else message, 'id', '?')}"
-            await process_post(message, links, ub.userbot, None)
+            await process_post(message, links, None, None, ws=uid)
 
-        count = await ub.scan_channel(source, callback, min_id=min_id, limit=limit)
+        count = await ub.scan_channel(source, callback, min_id=min_id, limit=limit, ws=uid)
 
         if count > 0 and min_id:
             try:
-                entity = await ub.userbot.get_entity(source)
-                msgs = await ub.userbot.get_messages(entity, limit=1)
+                client = pool.listener_client(uid)
+                entity = await client.get_entity(source)
+                msgs = await client.get_messages(entity, limit=1)
                 if msgs:
-                    await update_config("scan_start_id", msgs[0].id)
+                    await update_config("scan_start_id", msgs[0].id, uid)
                     await bot.send_message(
                         chat_id,
                         f"✅ Scan complete — *{count}* post(s) processed.\n"
@@ -642,12 +782,13 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    job = jobs.start_job("scan", desc, run, chat_id, update.effective_user.id)
+    job = jobs.start_job("scan", desc, run, chat_id, uid, ws=uid)
 
     await update.message.reply_text(
-        f"🔍 Scanning {desc} in source channel…\n"
-        f"Job id `{job.id}` — the bot stays fully usable while this runs.\n"
-        "_Cancel with /stop (all) or /cancel " + job.id + "._",
+        f"🔍 Scanning {desc} in your source channel…\n"
+        f"Job id `{job.id}` — the bot stays fully usable while this runs, "
+        "for you and for everyone else.\n"
+        "_Cancel with /stop (all yours) or /cancel " + job.id + "._",
         parse_mode="Markdown",
     )
 
@@ -655,8 +796,9 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
-    if not await ub.is_authorized():
-        await update.message.reply_text("❌ Userbot not logged in. Use /login first.")
+    uid = _uid(update)
+    if not await ub.is_authorized(uid):
+        await update.message.reply_text("❌ You have no logged-in account. Use /login first.")
         return
     if not context.args:
         await update.message.reply_text("Usage: /process <message_id>")
@@ -676,21 +818,21 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from bot import jobs
     from bot.processor import process_post
 
-    ub.reset_scan_cancel()
+    ub.reset_scan_cancel(uid)
     chat_id = update.effective_chat.id
     bot = context.bot
 
     async def run(job):
         async def callback(message, links):
-            await process_post(message, links, ub.userbot, None)
+            await process_post(message, links, None, None, ws=uid)
 
-        found = await ub.process_single(source, msg_id, callback)
+        found = await ub.process_single(source, msg_id, callback, ws=uid)
         await bot.send_message(
             chat_id,
             "✅ Message processed." if found else "❌ Message not found or has no bot link.",
         )
 
-    job = jobs.start_job("process", f"msg {msg_id}", run, chat_id, update.effective_user.id)
+    job = jobs.start_job("process", f"msg {msg_id}", run, chat_id, uid, ws=uid)
     await update.message.reply_text(
         f"⏳ Processing message `{msg_id}` in the background (job `{job.id}`).",
         parse_mode="Markdown",
@@ -887,8 +1029,9 @@ async def cmd_clear_text_rules(update: Update, context: ContextTypes.DEFAULT_TYP
 @admin_only
 async def cmd_fbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.client as ub
-    if not await ub.is_authorized():
-        await update.message.reply_text("❌ Userbot not logged in. Use /login first.")
+    uid = _uid(update)
+    if not await ub.is_authorized(uid):
+        await update.message.reply_text("❌ You have no logged-in account. Use /login first.")
         return
 
     if not context.args or len(context.args) < 2:
@@ -917,23 +1060,23 @@ async def cmd_fbatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from bot import jobs
     from bot.processor import process_post
 
-    ub.reset_scan_cancel()
+    ub.reset_scan_cancel(uid)
     chat_id = update.effective_chat.id
     bot = context.bot
 
     async def run(job):
         async def callback(message, links):
             job.progress = f"post {getattr(message[0] if isinstance(message, list) else message, 'id', '?')}"
-            await process_post(message, links, ub.userbot, None)
+            await process_post(message, links, None, None, ws=uid)
 
-        count = await ub.scan_range(source, start_id, end_id, callback)
+        count = await ub.scan_range(source, start_id, end_id, callback, ws=uid)
         await bot.send_message(
             chat_id,
             f"✅ Batch complete — *{count}* post(s) with links processed.",
             parse_mode="Markdown",
         )
 
-    job = jobs.start_job("fbatch", f"{start_id} → {end_id}", run, chat_id, update.effective_user.id)
+    job = jobs.start_job("fbatch", f"{start_id} → {end_id}", run, chat_id, uid, ws=uid)
 
     await update.message.reply_text(
         f"🔍 Scanning messages `{start_id}` → `{end_id}` in the background (job `{job.id}`).\n"
@@ -963,20 +1106,22 @@ async def cmd_debugchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import userbot.pool as pool
+    uid = _uid(update)
     cfg = await get_config()
-    if not pool.accounts:
+    accounts = pool.accounts_of(uid)
+    if not accounts:
         await update.message.reply_text(
-            "ℹ️ No userbot accounts yet. Send /login to add one."
+            "ℹ️ You have no userbot accounts yet. Send /login to add one."
         )
         return
     lines = []
-    for acc in pool.accounts:
+    for acc in accounts:
         lines.append(await acc.status_line())
     listener = cfg.get("listener_index", 1)
     linkacc  = cfg.get("link_account_index", 1)
     rotate   = "🟢 ON" if cfg.get("rotate_accounts", True) else "🔴 OFF"
     await update.message.reply_text(
-        "👥 *Userbot accounts*\n" + "\n".join(lines) +
+        "👥 *Your userbot accounts*\n" + "\n".join(lines) +
         f"\n\n👁 Listener: account `{listener}`"
         f"\n🔗 Link generator: account `{linkacc}`"
         f"\n🔁 Rotation: *{rotate}*\n\n"
@@ -1279,6 +1424,9 @@ def register_handlers(app):
     app.add_handler(login_conv)
     app.add_handler(CommandHandler("start",        cmd_start))
     app.add_handler(CommandHandler("help",         cmd_help))
+    app.add_handler(CommandHandler("whoami",       cmd_whoami))
+    app.add_handler(CommandHandler("myspace",      cmd_myspace))
+    app.add_handler(CommandHandler("workspaces",   cmd_workspaces))
     app.add_handler(CommandHandler("setsource",    cmd_set_source))
     app.add_handler(CommandHandler("setdb",        cmd_set_db))
     app.add_handler(CommandHandler("setoutput",    cmd_set_output))

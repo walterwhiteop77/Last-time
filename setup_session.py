@@ -1,10 +1,9 @@
 """
-Optional one-time helper: generate a StringSession for the FIRST userbot
-account without using the admin bot.
+Optional helper — prints a StringSession for one Telegram account.
 
-Normally you don't need this — just send /login to your admin bot (as many
-times as you have accounts). Use this script only if you prefer to seed the
-first account through the SESSION_STRING environment variable.
+You normally do NOT need this: every admin adds their own accounts straight
+from the bot with /login. Use it only if you want to seed the owner's first
+account through the SESSION_STRING environment variable.
 
     python setup_session.py
 """
@@ -16,18 +15,12 @@ from telethon.sessions import StringSession
 from config import API_ID, API_HASH
 
 
-async def main() -> None:
-    print("Logging in a Telegram user account…")
+async def main():
     async with TelegramClient(StringSession(), API_ID, API_HASH) as client:
-        me = await client.get_me()
-        print()
-        print(f"Logged in as: {me.first_name} (@{me.username})")
-        print()
-        print("Copy the line below into SESSION_STRING in your environment:")
-        print()
-        print(client.session.save())
-        print()
-        print("Extra accounts are added later with /login in the admin bot.")
+        session = StringSession.save(client.session)
+        print("\n=== SESSION_STRING (keep this secret) ===\n")
+        print(session)
+        print("\nAdd it to your .env as SESSION_STRING=… (optional).\n")
 
 
 if __name__ == "__main__":

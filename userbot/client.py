@@ -1,9 +1,9 @@
 """
-Userbot layer — now backed by the multi-account pool in `userbot/pool.py`.
+Userbot layer — one independent account pool per workspace (per admin).
 
-The *listener* account watches the source channel. Every heavy job (opening
-bot links, downloading, uploading) is handed to a rotating worker account so
-no single number carries all the traffic.
+Each workspace has its own listener account watching its own source channel,
+its own worker accounts and its own cancel flag, so two admins can run jobs
+at the same time without touching each other's setup.
 """
 
 import asyncio
@@ -18,57 +18,66 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from database import get_config, log_event
+import database as dbm
+from database import get_config, log_event, set_ws, list_workspaces
 import userbot.pool as pool
 
 _forward_callback = None
 
-# Fired once at least one account is logged in
-login_done = pool.login_done
+# Per-workspace cancel flags
+_cancelled: dict[int, bool] = {}
 
-# Set to True to cancel any running scan / fbatch
-_scan_cancelled: bool = False
+
+def _ws(ws=None) -> int:
+    return dbm._resolve(ws)
 
 
 # ── Compatibility shim ────────────────────────────────────────────────────────
-# Older code (and several admin commands) referenced the module-level
-# `userbot` client. It now resolves to the listener account's client.
 
-def _client():
-    c = pool.listener_client()
+def _client(ws=None):
+    c = pool.listener_client(ws)
     if c is None:
-        raise RuntimeError("No userbot account is logged in. Use /login first.")
+        raise RuntimeError("No userbot account is logged in for you. Use /login first.")
     return c
 
 
 class _ListenerProxy:
-    """Attribute proxy so `ub.userbot.<anything>` keeps working."""
+    """`ub.userbot.<anything>` → the current workspace's listener client."""
 
     def __getattr__(self, name):
         return getattr(_client(), name)
 
     def __bool__(self):
-        return pool.listener_client() is not None
+        try:
+            return pool.listener_client() is not None
+        except Exception:
+            return False
 
 
 userbot = _ListenerProxy()
 
 
-# ── Cancellation ──────────────────────────────────────────────────────────────
+# ── Cancellation (per workspace) ──────────────────────────────────────────────
 
-def cancel_scan():
-    global _scan_cancelled
-    _scan_cancelled = True
+def cancel_scan(ws=None):
+    uid = _ws(ws)
+    _cancelled[uid] = True
     try:
         from bot.processor import cancel_current_processing
-        cancel_current_processing()
+        cancel_current_processing(uid)
     except Exception as e:
         print(f"[userbot] Could not cancel in-flight processing: {e}")
 
 
-def reset_scan_cancel():
-    global _scan_cancelled
-    _scan_cancelled = False
+def reset_scan_cancel(ws=None):
+    _cancelled[_ws(ws)] = False
+
+
+def is_cancelled(ws=None) -> bool:
+    try:
+        return bool(_cancelled.get(_ws(ws), False))
+    except Exception:
+        return False
 
 
 def set_forward_callback(fn):
@@ -79,17 +88,12 @@ def set_forward_callback(fn):
 # ── Pool lifecycle ────────────────────────────────────────────────────────────
 
 async def init_client():
-    """Connect every stored account (migrating any legacy single session)."""
-    return await pool.load_pool()
+    """Connect every workspace's stored accounts."""
+    return await pool.load_all()
 
 
-async def connect():
-    """Kept for backwards compatibility — load_pool() already connects."""
-    return None
-
-
-async def is_authorized() -> bool:
-    for acc in pool.live_accounts():
+async def is_authorized(ws=None) -> bool:
+    for acc in pool.live_accounts(ws):
         try:
             if await acc.client.is_user_authorized():
                 return True
@@ -98,26 +102,26 @@ async def is_authorized() -> bool:
     return False
 
 
-# ── Login (delegates to the pool) ─────────────────────────────────────────────
+# ── Login (delegates to this workspace's pool) ────────────────────────────────
 
-async def send_code(phone: str) -> str:
-    await pool.begin_login(phone)
-    return pool.pending_hash
-
-
-async def sign_in(phone: str, code: str, phone_code_hash: str):
-    return await pool.complete_login_code(code)
+async def send_code(phone: str, ws=None) -> str:
+    p = pool.get_pool(ws)
+    await p.begin_login(phone)
+    return p.pending_hash
 
 
-async def sign_in_2fa(password: str):
-    return await pool.complete_login_2fa(password)
+async def sign_in(phone: str, code: str, phone_code_hash: str, ws=None):
+    return await pool.complete_login_code(code, ws)
+
+
+async def sign_in_2fa(password: str, ws=None):
+    return await pool.complete_login_2fa(password, ws)
 
 
 # ── Channel access ────────────────────────────────────────────────────────────
 
-async def join_source_channel(source: str, client=None):
-    """Join / subscribe to a channel with one account (default: listener)."""
-    client = client or _client()
+async def join_source_channel(source: str, client=None, ws=None):
+    client = client or _client(ws)
     try:
         await client.get_dialogs()
         entity = await client.get_entity(str(source))
@@ -127,8 +131,8 @@ async def join_source_channel(source: str, client=None):
         print(f"[userbot] Note: could not join {source} ({e}) — may already be a member")
 
 
-async def join_all_accounts(targets: list):
-    return await pool.join_everywhere([t for t in targets if t])
+async def join_all_accounts(targets: list, ws=None):
+    return await pool.join_everywhere([t for t in targets if t], ws)
 
 
 async def _match_source_chat(event, cfg) -> bool:
@@ -157,60 +161,63 @@ async def _match_source_chat(event, cfg) -> bool:
     return False
 
 
-async def begin_listening():
-    """Register event handlers on the listener account and run forever."""
-    acc = await pool.listener_account()
+# ── Listening (one listener task per workspace) ───────────────────────────────
+
+async def begin_listening(ws):
+    """Register event handlers on this workspace's listener account."""
+    ws = int(ws)
+    set_ws(ws)
+    p = pool.get_pool(ws)
+    acc = await p.listener()
     if acc is None or acc.client is None:
-        raise RuntimeError("No listener account available.")
+        raise RuntimeError(f"No listener account available for workspace {ws}.")
 
     client = acc.client
-    print(f"[userbot] Listener account: {acc.index}. {acc.label}")
+    print(f"[userbot:{ws}] Listener account: {acc.index}. {acc.label}")
 
     @client.on(events.NewMessage())
     async def on_new_message(event):
+        set_ws(ws)
         if event.message.grouped_id:
             return
 
-        cfg = await get_config()
+        cfg = await get_config(ws)
         if not cfg.get("active"):
             return
         if not await _match_source_chat(event, cfg):
             return
 
-        if _scan_cancelled:
-            reset_scan_cancel()
+        if is_cancelled(ws):
+            reset_scan_cancel(ws)
 
-        print(f"[userbot] New post in source channel — msg_id={event.message.id}")
-        await log_event("new_post", {"msg_id": event.message.id, "chat_id": event.chat_id})
+        print(f"[userbot:{ws}] New post in source — msg_id={event.message.id}")
+        await log_event("new_post", {"msg_id": event.message.id, "chat_id": event.chat_id}, ws)
 
         links = _extract_links(event.message)
         if not links:
-            print(f"[userbot] No links in post {event.message.id} — skipping")
             return
 
-        print(f"[userbot] Extracted {len(links)} link(s): {links}")
-
         if _forward_callback:
-            asyncio.create_task(_forward_callback(event.message, links))
+            asyncio.create_task(_forward_callback(event.message, links, ws))
 
     @client.on(events.Album())
     async def on_new_album(event):
-        cfg = await get_config()
+        set_ws(ws)
+        cfg = await get_config(ws)
         if not cfg.get("active"):
             return
         if not await _match_source_chat(event, cfg):
             return
 
-        if _scan_cancelled:
-            reset_scan_cancel()
+        if is_cancelled(ws):
+            reset_scan_cancel(ws)
 
         messages = event.messages
-        print(f"[userbot] New album — {len(messages)} item(s), first msg_id={messages[0].id}")
         await log_event("new_post", {
             "msg_id": messages[0].id,
             "chat_id": event.chat_id,
             "album_size": len(messages),
-        })
+        }, ws)
 
         links = []
         for m in messages:
@@ -218,29 +225,57 @@ async def begin_listening():
             if found:
                 links = found
                 break
-
         if not links:
-            print(f"[userbot] No links in album {messages[0].id} — skipping")
             return
 
-        print(f"[userbot] Extracted {len(links)} link(s) from album: {links}")
-
         if _forward_callback:
-            asyncio.create_task(_forward_callback(messages, links))
+            asyncio.create_task(_forward_callback(messages, links, ws))
 
-    print("[userbot] Authorized and listening for new posts.")
+    print(f"[userbot:{ws}] Listening for new posts.")
     await client.run_until_disconnected()
 
 
-async def restart_listening():
-    """Used after /setlistener — reconnect handlers on the new listener."""
-    asyncio.create_task(begin_listening())
+async def ensure_listener(ws) -> bool:
+    """Start (or restart) the listener task for one workspace."""
+    ws = int(ws)
+    p = pool.get_pool(ws)
+    if p.listener_task and not p.listener_task.done():
+        return True
+    if not p.live():
+        return False
+
+    async def runner():
+        set_ws(ws)
+        try:
+            await begin_listening(ws)
+        except Exception as e:
+            print(f"[userbot:{ws}] listener stopped: {e}")
+
+    p.listener_task = asyncio.ensure_future(runner())
+    return True
+
+
+async def restart_listening(ws=None):
+    ws = _ws(ws)
+    p = pool.get_pool(ws)
+    if p.listener_task and not p.listener_task.done():
+        p.listener_task.cancel()
+        p.listener_task = None
+    return await ensure_listener(ws)
+
+
+async def start_all_listeners():
+    started = 0
+    for ws in await list_workspaces():
+        if await ensure_listener(ws):
+            started += 1
+    return started
 
 
 # ── Entity resolution ─────────────────────────────────────────────────────────
 
-async def _resolve_entity(source: str, client=None):
-    client = client or _client()
+async def _resolve_entity(source: str, client=None, ws=None):
+    client = client or _client(ws)
     source = str(source).strip()
 
     bare_id = None
@@ -270,14 +305,11 @@ async def _resolve_entity(source: str, client=None):
         source_clean = source.lstrip("@")
 
         if bare_id and eid == bare_id:
-            print(f"[userbot] found entity via dialog walk: {getattr(entity, 'title', eid)}")
             return entity
         if username and username.lower() == source_clean.lower():
-            print(f"[userbot] found entity via username match: {username}")
             return entity
 
     try:
-        print(f"[userbot] trying to join {source}…")
         await join_source_channel(source, client)
         return await client.get_entity(source)
     except Exception as e:
@@ -314,22 +346,19 @@ def _links_for_group(group: list) -> list:
 
 # ── Scanning ──────────────────────────────────────────────────────────────────
 
-async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0) -> int:
-    """Scan the source channel (oldest → newest) and process posts with links."""
-    client = _client()
+async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0, ws=None) -> int:
+    ws = _ws(ws)
+    client = _client(ws)
     try:
-        entity = await _resolve_entity(source, client)
+        entity = await _resolve_entity(source, client, ws)
     except Exception as e:
-        print(f"[userbot] scan: {e}")
+        print(f"[userbot:{ws}] scan: {e}")
         return 0
 
     fetch_limit = limit if limit > 0 else None
     kwargs = dict(limit=fetch_limit)
     if min_id > 0:
         kwargs["min_id"] = min_id
-        print(f"[userbot] scan: fetching messages after ID {min_id}" + (f" (limit {limit})" if limit else ""))
-    else:
-        print(f"[userbot] scan: fetching last {limit} messages")
 
     all_messages = []
     async for message in client.iter_messages(entity, **kwargs):
@@ -337,19 +366,15 @@ async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0) -
     all_messages.reverse()
 
     groups = _group_by_album(all_messages)
-    matched = []
-    for group in groups:
-        links = _links_for_group(group)
-        if links:
-            matched.append((group, links))
+    matched = [(g, l) for g in groups if (l := _links_for_group(g))]
 
-    print(f"[userbot] scan: {len(matched)} posts with links (oldest→newest)")
+    print(f"[userbot:{ws}] scan: {len(matched)} posts with links (oldest→newest)")
 
-    reset_scan_cancel()
+    reset_scan_cancel(ws)
     processed = 0
     for group, links in matched:
-        if _scan_cancelled:
-            print(f"[userbot] scan: cancelled by /stop after {processed} posts")
+        if is_cancelled(ws):
+            print(f"[userbot:{ws}] scan cancelled after {processed} posts")
             break
         if callback:
             await callback(group, links)
@@ -357,52 +382,45 @@ async def scan_channel(source: str, callback, min_id: int = 0, limit: int = 0) -
     return processed
 
 
-# Backwards-compatible alias
-async def scan_recent(source: str, limit: int, callback, after_id: int = 0) -> int:
-    return await scan_channel(source, callback, min_id=after_id, limit=limit)
+async def scan_recent(source: str, limit: int, callback, after_id: int = 0, ws=None) -> int:
+    return await scan_channel(source, callback, min_id=after_id, limit=limit, ws=ws)
 
 
-async def scan_range(source: str, start_id: int, end_id: int, callback) -> int:
-    client = _client()
+async def scan_range(source: str, start_id: int, end_id: int, callback, ws=None) -> int:
+    ws = _ws(ws)
+    client = _client(ws)
     try:
-        entity = await _resolve_entity(source, client)
+        entity = await _resolve_entity(source, client, ws)
     except Exception as e:
-        print(f"[userbot] scan_range: {e}")
+        print(f"[userbot:{ws}] scan_range: {e}")
         return 0
 
-    print(f"[userbot] scan_range: fetching messages {start_id}–{end_id}")
     all_messages = []
     async for message in client.iter_messages(entity, min_id=start_id - 1, max_id=end_id):
         all_messages.append(message)
     all_messages.reverse()
 
     groups = _group_by_album(all_messages)
-    matched = []
-    for group in groups:
-        links = _links_for_group(group)
-        if links:
-            matched.append((group, links))
+    matched = [(g, l) for g in groups if (l := _links_for_group(g))]
 
-    print(f"[userbot] scan_range: {len(matched)} post(s) with links")
+    print(f"[userbot:{ws}] scan_range: {len(matched)} post(s) with links")
 
-    reset_scan_cancel()
+    reset_scan_cancel(ws)
     processed = 0
     for group, links in matched:
-        if _scan_cancelled:
-            print(f"[userbot] scan_range: cancelled by /stop after {processed} posts")
+        if is_cancelled(ws):
             break
-        print(f"[userbot] scan_range: msg {group[0].id} ({len(group)} item(s)) → {links}")
         if callback:
             await callback(group, links)
         processed += 1
-
     return processed
 
 
-async def process_single(source: str, msg_id: int, callback) -> bool:
+async def process_single(source: str, msg_id: int, callback, ws=None) -> bool:
+    ws = _ws(ws)
     try:
-        client = _client()
-        entity = await _resolve_entity(source, client)
+        client = _client(ws)
+        entity = await _resolve_entity(source, client, ws)
         messages = await client.get_messages(entity, ids=[msg_id])
         if not messages or not messages[0]:
             return False
@@ -421,10 +439,10 @@ async def process_single(source: str, msg_id: int, callback) -> bool:
         if not links:
             return False
         if callback:
-            asyncio.create_task(callback(group, links))
+            await callback(group, links)
         return True
     except Exception as e:
-        print(f"[userbot] process_single error: {e}")
+        print(f"[userbot:{ws}] process_single error: {e}")
         return False
 
 
@@ -481,8 +499,8 @@ def _extract_link(message) -> str | None:
     return links[0] if links else None
 
 
-async def click_bot_link_and_get_files(link: str, client=None) -> list:
-    client = client or _client()
+async def click_bot_link_and_get_files(link: str, client=None, ws=None) -> list:
+    client = client or _client(ws)
     import re as _re
     deep_link_re = _re.compile(r"https://t\.me/([^?/]+)\?start=(.+)")
     m = deep_link_re.match(link)

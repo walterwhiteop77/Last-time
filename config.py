@@ -25,8 +25,15 @@ except ValueError as exc:
 
 SESSION_NAME = "userbot_session"
 
+# Optional: your own Telegram user ID. The owner can add/remove other admins
+# and inherits the settings of the old single-user setup.
+try:
+    OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
+except ValueError:
+    OWNER_ID = 0
+
 # On hosts with an ephemeral filesystem the session is stored as a string.
-# Generate it once with:  python setup_session.py
+# Optional — only used to seed the owner's first account.
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
 # Port injected by the host; also used by the health-check web server

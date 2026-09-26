@@ -224,7 +224,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1️⃣ `/login` — add your Telegram account(s)\n"
         "2️⃣ `/setsource` `/setdb` `/setoutput` `/setsecondbot`\n"
         "3️⃣ `/enable` — start\n\n"
-        "Send /help for the full list, /myspace for your current setup.",
+        "Send /settings for the interactive menu, /help for all commands, /myspace for your setup.",
         parse_mode="Markdown",
     )
     try:
@@ -252,6 +252,7 @@ _Everything below applies to YOUR own setup only._
 ━━━━━━━━━━━━━━━━━━━━
 🏠 *Your workspace*
 ━━━━━━━━━━━━━━━━━━━━
+/settings — Interactive settings menu
 /myspace — Your setup at a glance
 /whoami — Your user ID
 /workspaces — All workspaces (owner only)
@@ -1410,6 +1411,7 @@ async def cmd_set_all_delays(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ─── Handler registration ────────────────────────────────────────────────────
 
 def register_handlers(app):
+    from bot.handlers.settings import register_settings
     login_conv = ConversationHandler(
         entry_points=[CommandHandler("login", cmd_login)],
         states={
@@ -1422,6 +1424,7 @@ def register_handlers(app):
     )
 
     app.add_handler(login_conv)
+    register_settings(app)
     app.add_handler(CommandHandler("start",        cmd_start))
     app.add_handler(CommandHandler("help",         cmd_help))
     app.add_handler(CommandHandler("whoami",       cmd_whoami))

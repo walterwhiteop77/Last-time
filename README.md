@@ -168,7 +168,7 @@ generated URL.
 
 ## Commands
 
-Send `/help` in the admin bot for the full, always-current list.
+Send `/settings` in the admin bot for the private inline settings menu (channels, processing, account roles and delays). Tap to choose an option; reply to the prompt when changing text or a number. Existing commands still work. Send `/help` for the full command list.
 
 ---
 

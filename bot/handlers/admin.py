@@ -1420,7 +1420,8 @@ def register_handlers(app):
             PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_got_password)],
         },
         fallbacks=[CommandHandler("cancel", login_cancel)],
-        conversation_timeout=120,
+        # NOTE: no conversation_timeout — it needs the optional JobQueue extra
+        # (pip install "python-telegram-bot[job-queue]") and is ignored otherwise.
     )
 
     app.add_handler(login_conv)

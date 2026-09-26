@@ -448,49 +448,62 @@ async def process_single(source: str, msg_id: int, callback, ws=None) -> bool:
 
 # ── Link extraction ───────────────────────────────────────────────────────────
 
-TG_LINK_RE = re.compile(r"https?://(?:t\.me|telegram\.me)/[^\s]+")
+TG_LINK_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/[^\s<>\"']+", re.I)
+TG_RESOLVE_RE = re.compile(r"tg://resolve\?[^\s<>\"']+", re.I)
 _TRAILING_JUNK = re.compile(r"[*_~`'\".),!?\]>]+$")
+_BOT_DEEP_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/([A-Za-z][A-Za-z0-9_]{3,31})/?\?(?:.*&)?start=([^&\s]+)",
+    re.I,
+)
+_TG_RESOLVE_DEEP_RE = re.compile(r"^tg://resolve\?(?=.*domain=([A-Za-z0-9_]+))(?=.*start=([^&\s]+))", re.I)
 
 
 def _clean_url(url: str) -> str:
-    return _TRAILING_JUNK.sub("", url)
+    return _TRAILING_JUNK.sub("", url.strip())
+
+
+def normalize_bot_link(url: str) -> str | None:
+    """Return 'https://t.me/<bot>?start=<param>' for bot deep links, else None.
+    Invite links (t.me/+xxx, joinchat), channel/post links are ignored."""
+    url = _clean_url(url or "")
+    m = _BOT_DEEP_RE.match(url) or _TG_RESOLVE_DEEP_RE.match(url)
+    if not m:
+        return None
+    return f"https://t.me/{m.group(1)}?start={m.group(2)}"
 
 
 def _extract_links(message) -> list:
     text = (getattr(message, 'text', None) or
             getattr(message, 'message', None) or
             getattr(message, 'caption', None) or "")
+    raw_text = getattr(message, 'raw_text', None) or getattr(message, 'message', None) or text
 
-    seen = {}
-
-    entities = getattr(message, "entities", None) or []
-    if entities:
-        for entity in entities:
-            if isinstance(entity, MessageEntityTextUrl):
-                url = _clean_url(entity.url)
-                if TG_LINK_RE.match(url):
-                    seen[url] = True
-            elif isinstance(entity, MessageEntityUrl):
-                start = entity.offset
-                end   = entity.offset + entity.length
-                url   = _clean_url(text[start:end])
-                if TG_LINK_RE.match(url):
-                    seen[url] = True
-
-    for m in TG_LINK_RE.finditer(text):
-        url = _clean_url(m.group(0))
-        if url not in seen:
-            seen[url] = True
-
-    if not seen and getattr(message, "reply_markup", None):
+    candidates = []
+    for entity in (getattr(message, "entities", None) or []):
         try:
-            for row in message.reply_markup.rows:
-                for btn in row.buttons:
-                    if hasattr(btn, "url") and btn.url:
-                        seen[btn.url] = True
+            if isinstance(entity, MessageEntityTextUrl):
+                candidates.append(entity.url)
+            elif isinstance(entity, MessageEntityUrl):
+                candidates.append(raw_text[entity.offset:entity.offset + entity.length])
         except Exception:
             pass
+    for src in (raw_text, text):
+        candidates += [m.group(0) for m in TG_LINK_RE.finditer(src or "")]
+        candidates += [m.group(0) for m in TG_RESOLVE_RE.finditer(src or "")]
+    try:
+        rm = getattr(message, "reply_markup", None)
+        for row in (getattr(rm, "rows", None) or []):
+            for btn in row.buttons:
+                if getattr(btn, "url", None):
+                    candidates.append(btn.url)
+    except Exception:
+        pass
 
+    seen = {}
+    for c in candidates:
+        n = normalize_bot_link(c)
+        if n and n not in seen:
+            seen[n] = True
     return list(seen.keys())
 
 
@@ -502,6 +515,7 @@ def _extract_link(message) -> str | None:
 async def click_bot_link_and_get_files(link: str, client=None, ws=None) -> list:
     client = client or _client(ws)
     import re as _re
+    link = normalize_bot_link(link) or link
     deep_link_re = _re.compile(r"https://t\.me/([^?/]+)\?start=(.+)")
     m = deep_link_re.match(link)
     if not m:
